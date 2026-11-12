@@ -1,0 +1,36 @@
+# Base de datos local: contiene rutas, huellas y notas privadas
+videos_index.db
+videos_index.db.*
+*.db
+*.db.*
+*.sqlite
+*.sqlite3
+
+# Respaldos y temporales
+*.bak
+*.bak_*
+*.backup
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Binarios de FFmpeg colocados junto al script
+ffmpeg.exe
+ffprobe.exe
+ffmpeg
+ffprobe
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
