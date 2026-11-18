@@ -15,6 +15,17 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
   UUID (Linux), no por letra de unidad.
 - Los videos de discos desconectados siguen apareciendo en gris, indicando qué
   disco hay que conectar.
+- Columna **Estado** que indica si cada archivo está `Presente`, `Falta`, en
+  un `Disco desconectado` o `Sin verificar`, con un filtro para ocultar los no
+  disponibles.
+- Tabla principal con barras de desplazamiento vertical y horizontal, para ver
+  todas las columnas aunque la ventana sea angosta. Los anchos de columna son
+  fijos, así que el pulgar horizontal sigue visible al maximizar la ventana.
+- Ruta completa de cada video al pasar el mouse por la columna **Carpeta**, o
+  desde el menú contextual → **Ver ruta completa…** (texto seleccionable y
+  botón **Copiar ruta**). El doble clic sigue abriendo el video.
+- Escaneo con leyenda de progreso permanente (`Etapa X de 7`), barra de avance y
+  conteo de carpetas/archivos/videos mientras se recorre el disco.
 - Exportación e importación de notas en un `.txt` (TSV) legible fuera del
   programa.
 - Reutilización de duraciones ya leídas por huella de contenido, sin volver a
@@ -34,6 +45,18 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
 python "video_duration_browser 1.0.py"
 ```
 
+También se puede ejecutar como módulo desde la carpeta del proyecto:
+
+```powershell
+python -m vdb
+```
+
+Tests (sin dependencias externas):
+
+```powershell
+python -m unittest discover -s tests -t .
+```
+
 Flujo básico:
 
 1. **Escanear carpeta/disco** para agregar un origen al índice.
@@ -41,6 +64,8 @@ Flujo básico:
 3. **Actualizar índice** para releer los discos conectados.
 4. Seleccionar videos y usar **Anotar (F2)** para agregar notas o etiquetas.
 5. Usar los filtros y hacer clic en los encabezados para ordenar.
+6. Usar **Verificar ahora** para comprobar que los archivos indexados siguen
+   existiendo en sus discos.
 
 Atajos principales:
 
@@ -56,9 +81,53 @@ contiene el índice, las rutas locales, identificadores de discos, huellas y
 notas privadas. **No se versiona en este repositorio**: está excluida por
 `.gitignore`, igual que cualquier respaldo o archivo temporal de la base.
 
-Si movés el script a otra carpeta, se crea una base nueva y vacía en la nueva
+La base se crea junto al lanzador, no dentro de `vdb/`. Si movés el lanzador y
+la carpeta `vdb/` a otra ubicación, se crea una base nueva y vacía en la nueva
 ubicación. Para conservar el índice, mové también `videos_index.db` o usá
 Exportar/Importar notas para trasladar las notas.
+
+## Disponibilidad de los archivos
+
+La columna **Estado** no modifica el índice: solo comprueba, sin borrar nada,
+si cada archivo sigue en la ruta donde fue indexado.
+
+| Estado | Significado |
+|---|---|
+| `Presente` | El disco está conectado y la ruta indexada existe. |
+| `Falta` | El disco está conectado, pero la ruta ya no existe. |
+| `Disco desconectado` | El volumen no está conectado; no se puede comprobar. |
+| `Sin verificar` | Aún no se comprobó, es una unidad de red o no se pudo leer. |
+
+- **Verificar ahora** recorre los archivos en segundo plano, muestra el progreso
+  y se puede cancelar.
+- El tick **Ocultar no disponibles** oculta `Falta` y `Disco desconectado`, y
+  lanza la verificación automáticamente si hace falta.
+- Las unidades de red no se verifican automáticamente para evitar bloqueos; si no
+  figuran entre los discos conectados, aparecen como `Disco desconectado`.
+- Un disco reconectado pasa a `Presente` o `Falta` después de verificar.
+- Si el mismo contenido aparece en dos ubicaciones y una está `Presente`, se
+  muestra solo esa: la copia no disponible se oculta en la vista, sin borrarla
+  del índice ni perder la nota (la nota va con la huella, no con la ruta). Si
+  ambas copias están presentes, se muestran las dos.
+- Escanear un disco sigue quitando del índice los archivos que ya no existen;
+  las notas se conservan. Para revisar sin tocar el índice, usá esta columna.
+
+### Etapas del escaneo
+
+La barra de estado indica siempre la etapa actual, por ejemplo
+`Etapa 2 de 7: Recorriendo carpetas — 412 carpetas, 3600 videos — F:/Series`.
+
+| Etapa | Qué hace |
+|---|---|
+| 1 | Preparando disco (ruta y volumen) |
+| 2 | Recorriendo carpetas y contando videos |
+| 3 | Leyendo el índice anterior |
+| 4 | Comparando con el índice |
+| 5 | Leyendo duraciones y huellas (`i / total`) |
+| 6 | Guardando índice y notas |
+| 7 | Consolidando ubicaciones y mostrando el resumen |
+
+Cuando se escanean varios discos, se agrega el prefijo `Disco i de N`.
 
 ## Notas y privacidad
 
@@ -72,7 +141,18 @@ Exportar/Importar notas para trasladar las notas.
 
 ```text
 Nuevo Archivo Total/
-  video_duration_browser 1.0.py   # aplicación completa
+  video_duration_browser 1.0.py   # lanzador de la aplicación
+  vdb/                            # código de la aplicación
+    config.py                     # constantes y rutas
+    text.py                       # texto, formato y extensiones
+    paths.py                      # rutas relativas al disco
+    volumes.py                    # identificación de discos
+    database.py                   # esquema, migraciones y notas
+    presence.py                   # verificación de disponibilidad
+    scan.py                       # escaneo, huellas y duraciones
+    fileops.py                    # eliminación de archivos
+    ui.py                         # interfaz Tkinter
+  tests/                          # tests de la capa de datos y utilidades
   README.md                       # este archivo
   .gitignore                      # excluye base de datos, respaldos y temporales
 ```
