@@ -329,6 +329,44 @@ def remove_file_records(pairs):
         con.close()
 
 
+def drop_superseded(hidden, replacements):
+    """Quita del indice las ubicaciones superadas por otra comprobada.
+
+    ``hidden`` son filas con ``(vol, rel)``; ``replacements`` es
+    ``{nkey: ruta_ganadora}``. Las notas nunca se borran ni cambian de clave:
+    solo se actualiza ``last_path`` para que no quede la ruta vieja.
+
+    Devuelve ``(filas_borradas, notas_actualizadas)``. Si algo falla, hace
+    rollback de toda la operacion.
+    """
+    pairs = [(r.vol, r.rel) for r in hidden]
+    if not pairs and not replacements:
+        return 0, 0
+    con = open_db()
+    removed = updated = 0
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if pairs:
+                cur = con.executemany(
+                    "DELETE FROM files WHERE vol = ? AND rel = ?", pairs)
+                removed = max(0, cur.rowcount)
+            now = time.time()
+            for key, path in replacements.items():
+                cur = con.execute(
+                    "UPDATE notes SET last_path = ?, updated = ? WHERE key = ?",
+                    (path, now, key),
+                )
+                updated += max(0, cur.rowcount)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+    finally:
+        con.close()
+    return removed, updated
+
+
 def export_notes_to(con, filepath):
     paths = {}
     q = ("SELECT f.nkey, f.rel, v.mount FROM files f JOIN volumes v ON v.id = f.vol "

@@ -61,6 +61,50 @@ class LabelsTest(unittest.TestCase):
         self.assertFalse(presence.presence_blocked(presence.UNKNOWN))
 
 
+class SupersededTest(unittest.TestCase):
+    def make(self, key, state, path, vol=1, rel="a.mp4"):
+        return SimpleNamespace(key=key, presence=state, path=path, vol=vol, rel=rel)
+
+    def test_ubicacion_vieja_y_ruta_ganadora(self):
+        gone = self.make("huella-1", presence.MISSING, "C:\\videos\\a.mp4", 1)
+        good = self.make("huella-1", presence.PRESENT, "F:\\videos\\a.mp4", 2)
+        hidden, repl = presence.superseded_locations([gone, good])
+        self.assertEqual(hidden, [gone])
+        self.assertEqual(repl, {"huella-1": "F:\\videos\\a.mp4"})
+
+    def test_grupo_con_una_sola_fila_no_genera_reemplazo(self):
+        only = self.make("huella-1", presence.PRESENT, "F:\\a.mp4")
+        hidden, repl = presence.superseded_locations([only])
+        self.assertEqual((hidden, repl), ([], {}))
+
+    def test_dos_presentes_no_descartan_nada(self):
+        one = self.make("huella-1", presence.PRESENT, "C:\\a.mp4", 1)
+        two = self.make("huella-1", presence.PRESENT, "F:\\a.mp4", 2)
+        hidden, repl = presence.superseded_locations([one, two])
+        self.assertEqual((hidden, repl), ([], {}))
+
+    def test_sin_presente_no_descarta_nada(self):
+        one = self.make("huella-1", presence.MISSING, "C:\\a.mp4", 1)
+        two = self.make("huella-1", presence.OFFLINE, "E:\\a.mp4", 2)
+        hidden, repl = presence.superseded_locations([one, two])
+        self.assertEqual((hidden, repl), ([], {}))
+
+    def test_clave_de_ruta_no_se_agrupa(self):
+        one = self.make("path:vol|uno", presence.PRESENT, "C:\\a.mp4", 1)
+        two = self.make("path:vol|dos", presence.MISSING, "F:\\a.mp4", 2)
+        hidden, repl = presence.superseded_locations([one, two])
+        self.assertEqual((hidden, repl), ([], {}))
+
+    def test_consolidate_rows_sigue_usando_la_misma_regla(self):
+        gone = self.make("huella-1", presence.MISSING, "C:\\a.mp4", 1)
+        good = self.make("huella-1", presence.PRESENT, "F:\\a.mp4", 2)
+        hidden, repl = presence.superseded_locations([gone, good])
+        kept, view_hidden = presence.consolidate_rows([gone, good])
+        self.assertEqual(kept, [good])
+        self.assertEqual(view_hidden, hidden)
+        self.assertEqual(repl["huella-1"], good.path)
+
+
 class WorkerTest(unittest.TestCase):
     def run_worker(self, rows, stop=None):
         q = []

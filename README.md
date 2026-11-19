@@ -24,6 +24,14 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
 - Ruta completa de cada video al pasar el mouse por la columna **Carpeta**, o
   desde el menú contextual → **Ver ruta completa…** (texto seleccionable y
   botón **Copiar ruta**). El doble clic sigue abriendo el video.
+- Tooltips en botones, filtros y campos; el botón **Ayuda / Primer uso…** (o el
+  menú **Ayuda → Primer uso…**) muestra el orden de los botones para el primer
+  uso y para los posteriores.
+- Si un video se movió de ubicación, la copia `Presente` gana: la ruta vieja se
+  quita del índice y la nota sigue unida al contenido (se actualiza solo la
+  ruta guardada, nunca el texto ni la clave de la nota). Si ambas copias están
+  presentes, se conservan las dos. La poda ocurre al terminar un escaneo o una
+  verificación; una verificación cancelada no quita nada.
 - Escaneo con leyenda de progreso permanente (`Etapa X de 7`), barra de avance y
   conteo de carpetas/archivos/videos mientras se recorre el disco.
 - Exportación e importación de notas en un `.txt` (TSV) legible fuera del
@@ -57,15 +65,27 @@ Tests (sin dependencias externas):
 python -m unittest discover -s tests -t .
 ```
 
-Flujo básico:
+Flujo básico (también disponible en **Ayuda / Primer uso…**):
 
-1. **Escanear carpeta/disco** para agregar un origen al índice.
-2. **Discos** para ver los orígenes conocidos, escanear o actualizar.
-3. **Actualizar índice** para releer los discos conectados.
-4. Seleccionar videos y usar **Anotar (F2)** para agregar notas o etiquetas.
-5. Usar los filtros y hacer clic en los encabezados para ordenar.
-6. Usar **Verificar ahora** para comprobar que los archivos indexados siguen
-   existiendo en sus discos.
+Primer uso:
+
+1. **Escanear carpeta/disco…** para elegir la carpeta o el disco a catalogar
+   (necesitás `ffprobe.exe` junto al script o en el `PATH`).
+2. Seleccionar videos y usar **Anotar… (F2)** para agregar notas o etiquetas;
+   la nota queda asociada al contenido, no a la ruta.
+3. **Verificar ahora** para comprobar qué archivos siguen presentes.
+
+Usos posteriores:
+
+1. Conectar los discos que quieras consultar.
+2. **Actualizar índice** para releer los discos ya configurados. Si cambiaste
+   las carpetas, usá **Discos…** para elegir las raíces.
+3. **Verificar ahora** después de mover o borrar videos; se puede cancelar y no
+   modifica las notas.
+4. Usar los filtros (**Buscar**, **Notas**, **Duración**, **Ocultar no
+   disponibles**) y hacer clic en un encabezado para ordenar.
+5. Doble clic abre el video; clic derecho → **Ver ruta completa…** muestra la
+   ruta sin cortar.
 
 Atajos principales:
 
@@ -106,9 +126,13 @@ si cada archivo sigue en la ruta donde fue indexado.
   figuran entre los discos conectados, aparecen como `Disco desconectado`.
 - Un disco reconectado pasa a `Presente` o `Falta` después de verificar.
 - Si el mismo contenido aparece en dos ubicaciones y una está `Presente`, se
-  muestra solo esa: la copia no disponible se oculta en la vista, sin borrarla
-  del índice ni perder la nota (la nota va con la huella, no con la ruta). Si
-  ambas copias están presentes, se muestran las dos.
+  muestra solo esa: la copia no disponible se oculta en la vista y al terminar
+  el escaneo o la verificación se quita del índice. La nota no se pierde: va con
+  la huella, y solo se actualiza su ruta guardada. Si ambas copias están
+  presentes, se conservan las dos. Si no hay ninguna `Presente`, no se quita
+  ninguna fila.
+- Una verificación cancelada no poda nada: el estado es parcial y no se puede
+  decidir qué ubicación ganó.
 - Escanear un disco sigue quitando del índice los archivos que ya no existen;
   las notas se conservan. Para revisar sin tocar el índice, usá esta columna.
 

@@ -47,6 +47,55 @@ class UiSmokeTest(unittest.TestCase):
         root.update_idletasks()
         return app
 
+    def seed_moved_video(self):
+        """Dos copias con la misma huella y una nota en la ruta vieja."""
+        con = database.open_db()
+        try:
+            con.executemany(
+                "INSERT INTO volumes (id, ident, label, mount, kind, workers) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(1, "C", "C", "C:\\", "fixed", 4), (2, "F", "F", "F:\\", "fixed", 4)],
+            )
+            con.executemany(
+                "INSERT INTO files (vol, rel, size, mtime, duration, fp, nkey) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(1, "video.mp4", 100, 1.0, 60.0, "fp", "huella-1"),
+                 (2, "video.mp4", 100, 1.0, 60.0, "fp", "huella-1")],
+            )
+            con.execute(
+                "INSERT INTO notes (key, note, last_path, updated) VALUES (?, ?, ?, ?)",
+                ("huella-1", "nota", "C:\\videos\\video.mp4", 1.0),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def read_index(self):
+        con = database.open_db()
+        try:
+            files = con.execute("SELECT vol, rel FROM files ORDER BY vol").fetchall()
+            note = con.execute(
+                "SELECT note, last_path FROM notes WHERE key = 'huella-1'").fetchone()
+            return files, note
+        finally:
+            con.close()
+
+    def moved_rows(self):
+        gone = make_row("video.mp4", MISSING, key="huella-1",
+                        disk="Disco (C:)", path="C:\\videos\\video.mp4")
+        good = make_row("video.mp4", PRESENT, key="huella-1",
+                        disk="Disco (F:)", path="F:\\videos\\video.mp4")
+        return gone._replace(vol=1, rel="video.mp4"), good._replace(vol=2, rel="video.mp4")
+
+    def live_moved_rows(self, all_rows):
+        """Filas que siguen en la base, con los estados de la prueba."""
+        con = database.open_db()
+        try:
+            live = set(con.execute("SELECT vol, rel FROM files").fetchall())
+        finally:
+            con.close()
+        return [r for r in all_rows if (r.vol, r.rel) in live]
+
     def test_ventana_principal_se_construye(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = self.open_app(tmp)
@@ -168,6 +217,87 @@ class UiSmokeTest(unittest.TestCase):
                 app.tree.selection_set("0")
                 app.show_path_dialog()
                 dialog.assert_called_once_with(app.master, row)
+
+    def test_botones_con_tooltip_y_ayuda_de_primer_uso(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp)
+            self.assertEqual(app.btn_help.cget("text"), "Ayuda / Primer uso…")
+            for widget in (app.btn_scan, app.btn_disks, app.btn_update, app.btn_verify,
+                           app.btn_cancel, app.chk_retry, app.btn_annotate,
+                           app.btn_help, app.ent_search, app.cb_scope, app.cb_notes,
+                           app.ent_min, app.ent_max, app.chk_hide):
+                self.assertTrue(widget.bind("<Enter>"))
+                self.assertTrue(widget.bind("<Leave>"))
+
+            app.tips.show(ui.WIDGET_TIPS["scan"], 10, 10)
+            self.assertIsNotNone(app.tip)
+            tip_text = app.tip.winfo_children()[0].cget("text")
+            self.assertEqual(tip_text, ui.WIDGET_TIPS["scan"])
+            app.hide_tooltip()
+            self.assertIsNone(app.tip)
+
+            with mock.patch.object(ui.tk.Toplevel, "wait_visibility"), \
+                    mock.patch.object(ui.tk.Toplevel, "grab_set"), \
+                    mock.patch.object(ui.tk.Toplevel, "wait_window"):
+                app.show_help()
+            dialogs = [w for w in app.master.winfo_children()
+                       if hasattr(w, "title") and w.title() == "Ayuda / Primer uso"]
+            self.assertEqual(len(dialogs), 1)
+            texts = []
+            stack = list(dialogs[0].winfo_children())
+            while stack:
+                widget = stack.pop()
+                stack.extend(widget.winfo_children())
+                if isinstance(widget, tk.Text):
+                    texts.append(widget.get("1.0", "end-1c"))
+            self.assertEqual(len(texts), 1)
+            self.assertIn("PRIMER USO", texts[0])
+            self.assertIn("USOS POSTERIORES", texts[0])
+            self.assertIn("CAMBIOS DE UBICACIÓN", texts[0])
+
+    def test_verificacion_quita_ruta_vieja_y_conserva_nota(self):
+        gone, good = self.moved_rows()
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp, [gone, good])
+            self.seed_moved_video()
+            with mock.patch.object(ui, "fetch_rows",
+                                   side_effect=lambda c, p=None: self.live_moved_rows(
+                                       [gone, good])):
+                app.finish_presence({}, False)
+            files, note = self.read_index()
+            self.assertEqual(files, [(2, "video.mp4")])
+            self.assertEqual(note, ("nota", "F:\\videos\\video.mp4"))
+            self.assertIn("1 ubicación anterior quitada", app.pruned_notice)
+
+    def test_verificacion_cancelada_no_quita_nada(self):
+        gone, good = self.moved_rows()
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp, [gone, good])
+            self.seed_moved_video()
+            with mock.patch.object(ui, "fetch_rows",
+                                   side_effect=lambda c, p=None: self.live_moved_rows(
+                                       [gone, good])):
+                app.finish_presence({}, True)
+            files, note = self.read_index()
+            self.assertEqual(files, [(1, "video.mp4"), (2, "video.mp4")])
+            self.assertEqual(note, ("nota", "C:\\videos\\video.mp4"))
+            self.assertEqual(app.pruned_notice, "")
+
+    def test_escaneo_quita_ruta_vieja_de_la_raiz_escaneada(self):
+        gone, good = self.moved_rows()
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp, [gone, good])
+            self.seed_moved_video()
+            app.scan_jobs = [database.Job(2, "F", "F:\\", "", 4, "Disco (F:)")]
+            with mock.patch.object(ui, "list_connected_volumes", return_value={}), \
+                    mock.patch.object(ui, "fetch_rows",
+                                      side_effect=lambda c, p=None:
+                                      self.live_moved_rows([gone, good])):
+                app.finish_scan(completed=True)
+            files, note = self.read_index()
+            self.assertEqual(files, [(2, "video.mp4")])
+            self.assertEqual(note, ("nota", "F:\\videos\\video.mp4"))
+            self.assertIn("1 ubicación anterior quitada", app.pruned_notice)
 
 
 if __name__ == "__main__":

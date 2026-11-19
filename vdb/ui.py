@@ -13,15 +13,15 @@ from tkinter import filedialog, messagebox, ttk
 
 from .config import DEFAULT_VIDEO_EXT, MAX_ROWS_SHOWN, NT
 from .database import (
-    Job, add_root, build_jobs, export_notes_to, fetch_rows, get_or_create_volume,
-    import_notes_from, load_extensions, open_db, remove_file_records,
-    save_extensions, save_notes, volume_states,
+    Job, add_root, build_jobs, drop_superseded, export_notes_to, fetch_rows,
+    get_or_create_volume, import_notes_from, load_extensions, open_db,
+    remove_file_records, save_extensions, save_notes, volume_states,
 )
 from .fileops import delete_permanently, send_to_trash
-from .paths import disk_text, display_path, rel_of
+from .paths import disk_text, display_path, ncase, rel_of
 from .presence import (
-    MISSING, OFFLINE, PRESENCE_ORDER, consolidate_rows, presence_blocked,
-    presence_label, presence_worker,
+    MISSING, OFFLINE, PRESENCE_ORDER, PRESENT, consolidate_rows, presence_blocked,
+    presence_label, presence_worker, superseded_locations,
 )
 from .scan import definitely_missing, find_ffprobe, root_alive, scan_worker
 from .text import (
@@ -78,6 +78,140 @@ def stage_text(stages, stage, detail=""):
 def location_text(row):
     """Ruta completa de una fila, para el tooltip y el dialogo."""
     return f"Archivo: {row.path}\nCarpeta: {row.folder}\nDisco: {row.disk}"
+
+
+WIDGET_TIPS = {
+    "scan": "Primer uso: elegí la carpeta o el disco a indexar.",
+    "disks": "Discos conocidos: marcá cuáles escanear o quitá del índice.",
+    "update": "Usos posteriores: volvé a recorrer los discos ya configurados.",
+    "verify": "Comprueba qué archivos siguen presentes sin borrar nada.",
+    "cancel": "Detiene el escaneo o la verificación en curso.",
+    "retry": "Incluye carpetas ilegibles en el próximo escaneo.",
+    "annotate": "Agrega o edita la nota de la fila seleccionada; se guarda por contenido.",
+    "help": "Muestra el orden de botones para el primer uso y para los siguientes.",
+    "search": "Filtra por texto; el ámbito elige si busca en ruta, notas o ambos.",
+    "scope": "Elige dónde buscar el texto: ruta y notas, solo notas o solo ruta.",
+    "notes_filter": "Muestra todas las filas, solo las que tienen nota o solo las que no.",
+    "min_duration": "Duración mínima en minutos (dejar vacío para no filtrar).",
+    "max_duration": "Duración máxima en minutos (dejar vacío para no filtrar).",
+    "hide_unavailable": "Esconde Falta y Disco desconectado y lanza la verificación.",
+}
+
+HELP_TEXT = """PRIMER USO
+
+1. Escanear carpeta/disco…: elegí la carpeta o el disco que querés catalogar.
+   Necesitás ffprobe.exe junto al script o en el PATH para leer duraciones.
+2. Cuando termine el escaneo, seleccioná videos y usá Anotar… (F2) para
+   agregar notas o etiquetas. La nota va con el contenido, no con la ruta.
+3. Usá Verificar ahora para comprobar qué archivos siguen presentes.
+
+USOS POSTERIORES
+
+1. Conectá los discos que quieras consultar.
+2. Actualizar índice: vuelve a recorrer los discos ya configurados y quita
+   del índice los archivos que ya no están. Si cambiaste de carpetas, usá
+   Discos… para elegir las raíces.
+3. Verificar ahora: comprobá qué archivos siguen presentes después de mover
+   o borrar videos. Se puede cancelar y no modifica las notas.
+4. Usá los filtros (Buscar, Notas, Duración y Ocultar no disponibles) y
+   hacé clic en un encabezado para ordenar.
+5. Doble clic abre el video; clic derecho → Ver ruta completa… muestra la
+   ruta sin cortar.
+
+CAMBIOS DE UBICACIÓN
+
+Si el mismo video aparece en otra ubicación, se conserva la copia presente:
+la ruta vieja se quita del índice, se actualiza la ruta guardada en la nota
+y el texto de la nota se mantiene. Si ambas copias están presentes, se
+conservan las dos. Al terminar una verificación cancelada no se quita nada.
+"""
+
+
+class TipManager:
+    """Tooltips programados, compartidos por la tabla y los controles."""
+
+    DELAY = 300
+
+    def __init__(self, master):
+        self.master = master
+        self.tip = None
+        self.after = None
+        self.key = None
+
+    def bind(self, widget, text):
+        """Muestra `text` al pasar sobre `widget`; lo oculta al salir o hacer clic."""
+        def on_enter(event):
+            self.schedule(widget, text, event.x_root, event.y_root)
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", lambda _e: self.hide())
+        widget.bind("<ButtonPress>", lambda _e: self.hide())
+
+    def schedule(self, key, text, x, y):
+        if self.key is key:
+            return
+        self.hide()
+        self.key = key
+        self.after = self.master.after(self.DELAY, lambda: self.show(text, x, y))
+
+    def show(self, text, x, y):
+        self.after = None
+        if self.tip is not None:
+            self.tip.destroy()
+        self.tip = tk.Toplevel(self.master)
+        self.tip.wm_overrideredirect(True)
+        label = tk.Label(
+            self.tip, text=text, justify="left", wraplength=520,
+            background="#ffffe0", relief="solid", bd=1, padx=6, pady=4,
+        )
+        label.pack()
+        self.tip.update_idletasks()
+        w, h = self.tip.winfo_width(), self.tip.winfo_height()
+        sx, sy = x + 14, y + 18
+        sw, sh = self.tip.winfo_screenwidth(), self.tip.winfo_screenheight()
+        if sx + w > sw:
+            sx = max(0, sw - w - 4)
+        if sy + h > sh:
+            sy = max(0, sh - h - 4)
+        self.tip.wm_geometry(f"+{sx}+{sy}")
+
+    def hide(self):
+        if self.after is not None:
+            try:
+                self.master.after_cancel(self.after)
+            except tk.TclError:
+                pass
+            self.after = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+        self.key = None
+
+
+class HelpDialog(tk.Toplevel):
+    """Muestra el orden de botones para el primer uso y los posteriores."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Ayuda / Primer uso")
+        self.transient(master)
+        self.resizable(True, True)
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        text = tk.Text(frm, wrap="word", height=20, width=80)
+        text.insert("1.0", HELP_TEXT)
+        text.configure(state="disabled")
+        text.pack(fill="both", expand=True)
+        bf = ttk.Frame(frm)
+        bf.pack(fill="x", pady=(8, 0))
+        ttk.Button(bf, text="Cerrar", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.geometry(f"+{master.winfo_rootx() + 80}+{master.winfo_rooty() + 80}")
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window(self)
 
 
 class NoteDialog(tk.Toplevel):
@@ -501,9 +635,9 @@ class App:
         self.scan_job_total = 0
         self.presence_stage = 0
         self.duplicate_hidden = []
-        self.tip = None
-        self.tip_after = None
-        self.tip_row = None
+        self.pruned_notice = ""
+        self.scan_jobs = []
+        self.tips = TipManager(master)
 
         self._build_ui()
         self.refresh_connected()
@@ -517,6 +651,31 @@ class App:
             self.status_var.set(
                 "ffprobe no encontrado: colocar ffprobe.exe junto al script o en el PATH."
             )
+
+    # Compatibilidad: los nombres anteriores siguen apuntando al TipManager.
+    @property
+    def tip(self):
+        return self.tips.tip
+
+    @tip.setter
+    def tip(self, value):
+        self.tips.tip = value
+
+    @property
+    def tip_after(self):
+        return self.tips.after
+
+    @tip_after.setter
+    def tip_after(self, value):
+        self.tips.after = value
+
+    @property
+    def tip_row(self):
+        return self.tips.key
+
+    @tip_row.setter
+    def tip_row(self, value):
+        self.tips.key = value
 
     # -- construccion ---------------------------------------------------------
     def _build_ui(self):
@@ -535,6 +694,9 @@ class App:
         index_menu.add_separator()
         index_menu.add_command(label="Limpiar inexistentes…", command=self.clean_missing)
         menubar.add_cascade(label="Índice", menu=index_menu)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Primer uso…", command=self.show_help)
+        menubar.add_cascade(label="Ayuda", menu=help_menu)
         self.master.config(menu=menubar)
 
         top = ttk.Frame(self.master, padding=(8, 8, 8, 2))
@@ -549,30 +711,57 @@ class App:
         self.btn_verify.pack(side="left", padx=(6, 0))
         self.btn_cancel = ttk.Button(top, text="Cancelar", command=self.on_cancel, state="disabled")
         self.btn_cancel.pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(top, text="Reintentar fallidos", variable=self.retry_var).pack(
-            side="left", padx=(12, 0)
-        )
-        ttk.Button(top, text="Anotar… (F2)", command=self.annotate_selected).pack(side="right")
+        self.chk_retry = ttk.Checkbutton(top, text="Reintentar fallidos",
+                                         variable=self.retry_var)
+        self.chk_retry.pack(side="left", padx=(12, 0))
+        self.btn_help = ttk.Button(top, text="Ayuda / Primer uso…", command=self.show_help)
+        self.btn_help.pack(side="right")
+        self.btn_annotate = ttk.Button(top, text="Anotar… (F2)",
+                                       command=self.annotate_selected)
+        self.btn_annotate.pack(side="right", padx=(0, 6))
 
         flt = ttk.Frame(self.master, padding=(8, 2, 8, 6))
         flt.pack(fill="x")
         ttk.Label(flt, text="Buscar:").pack(side="left")
-        ttk.Entry(flt, textvariable=self.search_var, width=34).pack(side="left", padx=(4, 6))
-        ttk.Combobox(flt, textvariable=self.scope_var, values=SCOPES, state="readonly",
-                     width=12).pack(side="left", padx=(0, 10))
+        self.ent_search = ttk.Entry(flt, textvariable=self.search_var, width=34)
+        self.ent_search.pack(side="left", padx=(4, 6))
+        self.cb_scope = ttk.Combobox(flt, textvariable=self.scope_var, values=SCOPES,
+                                     state="readonly", width=12)
+        self.cb_scope.pack(side="left", padx=(0, 10))
         ttk.Label(flt, text="Notas:").pack(side="left")
-        ttk.Combobox(flt, textvariable=self.notes_filter_var, values=NOTE_FILTERS,
-                     state="readonly", width=9).pack(side="left", padx=(4, 10))
+        self.cb_notes = ttk.Combobox(flt, textvariable=self.notes_filter_var,
+                                     values=NOTE_FILTERS, state="readonly", width=9)
+        self.cb_notes.pack(side="left", padx=(4, 10))
         ttk.Label(flt, text="Duración mín (min):").pack(side="left")
-        ttk.Entry(flt, textvariable=self.min_var, width=6).pack(side="left", padx=(4, 8))
+        self.ent_min = ttk.Entry(flt, textvariable=self.min_var, width=6)
+        self.ent_min.pack(side="left", padx=(4, 8))
         ttk.Label(flt, text="máx (min):").pack(side="left")
-        ttk.Entry(flt, textvariable=self.max_var, width=6).pack(side="left", padx=(4, 0))
-        ttk.Checkbutton(flt, text="Ocultar no disponibles",
-                        variable=self.hide_unavailable_var,
-                        command=self.on_hide_unavailable).pack(side="left", padx=(14, 0))
+        self.ent_max = ttk.Entry(flt, textvariable=self.max_var, width=6)
+        self.ent_max.pack(side="left", padx=(4, 0))
+        self.chk_hide = ttk.Checkbutton(flt, text="Ocultar no disponibles",
+                                        variable=self.hide_unavailable_var,
+                                        command=self.on_hide_unavailable)
+        self.chk_hide.pack(side="left", padx=(14, 0))
         for v in (self.search_var, self.scope_var, self.notes_filter_var,
                   self.min_var, self.max_var):
             v.trace_add("write", lambda *_: self.schedule_refresh())
+        for widget, tip in (
+            (self.btn_scan, WIDGET_TIPS["scan"]),
+            (self.btn_disks, WIDGET_TIPS["disks"]),
+            (self.btn_update, WIDGET_TIPS["update"]),
+            (self.btn_verify, WIDGET_TIPS["verify"]),
+            (self.btn_cancel, WIDGET_TIPS["cancel"]),
+            (self.chk_retry, WIDGET_TIPS["retry"]),
+            (self.btn_annotate, WIDGET_TIPS["annotate"]),
+            (self.btn_help, WIDGET_TIPS["help"]),
+            (self.ent_search, WIDGET_TIPS["search"]),
+            (self.cb_scope, WIDGET_TIPS["scope"]),
+            (self.cb_notes, WIDGET_TIPS["notes_filter"]),
+            (self.ent_min, WIDGET_TIPS["min_duration"]),
+            (self.ent_max, WIDGET_TIPS["max_duration"]),
+            (self.chk_hide, WIDGET_TIPS["hide_unavailable"]),
+        ):
+            self.tips.bind(widget, tip)
 
         mid = ttk.Frame(self.master, padding=(8, 0, 8, 0))
         mid.pack(fill="both", expand=True)
@@ -723,7 +912,8 @@ class App:
             out = kept
 
         # Si el mismo contenido esta en dos lugares, se conserva la ubicacion
-        # comprobada (Presente). Sin tocar la base ni las notas.
+        # comprobada (Presente). La poda en base ocurre al terminar el escaneo
+        # o la verificacion; aqui solo se decide qué se muestra.
         out, self.duplicate_hidden = consolidate_rows(out)
 
         out.sort(key=SORT_KEYS[self.sort_key], reverse=self.sort_desc)
@@ -873,6 +1063,8 @@ class App:
             return
         self.scan_note = ("Desconectados (índice conservado): " + ", ".join(offline)
                           if offline else "")
+        self.scan_jobs = list(jobs)
+        self.pruned_notice = ""
         if self.is_verifying():
             self.presence_stop.set()
         self.stop.clear()
@@ -979,7 +1171,7 @@ class App:
                     self.scan_status(5, f"{msg[1]} / {msg[2]}")
                     self.show_progress("determinate", msg[1], msg[2])
                 elif kind == "done":
-                    self.finish_scan()
+                    self.finish_scan(completed=not msg[1].startswith("Cancelado"))
                     self.hide_progress()
                     text = msg[1]
                     if self.scan_note:
@@ -987,12 +1179,14 @@ class App:
                     dup = self.duplicate_detail()
                     if dup:
                         text += " " + dup
+                    if self.pruned_notice:
+                        text += " " + self.pruned_notice
                     self.scan_status(7, f"{text}  {self.summary}")
                     if msg[2]:
                         messagebox.showwarning("Avisos del escaneo", "\n\n".join(msg[2]))
                     self._verify_if_hidden()
                 elif kind == "error":
-                    self.finish_scan()
+                    self.finish_scan(completed=False)
                     self.hide_progress()
                     self.scan_status(7, f"Error: {msg[1]}")
                     messagebox.showerror("Error durante el escaneo", msg[1])
@@ -1009,12 +1203,46 @@ class App:
             pass
         self.master.after(100, self.poll)
 
-    def finish_scan(self):
+    def finish_scan(self, completed=True):
         self.set_busy(False)
-        self.presence_cache.clear()
         self.refresh_connected()
+        if completed:
+            # Los archivos de la raiz recien escaneada se vieron en disco, así
+            # que cuentan como Presente para decidir qué ruta vieja se descarta.
+            # El resto conserva el estado verificado que hubiera antes.
+            current = fetch_rows(self.connected, dict(self.presence_cache))
+            scanned = set()
+            for job in self.scan_jobs:
+                pfx = ncase(job.root_rel) + "/" if job.root_rel else ""
+                for r in current:
+                    if r.vol != job.vol or not r.online:
+                        continue
+                    rel = ncase(r.rel)
+                    if not job.root_rel or rel.startswith(pfx):
+                        scanned.add((r.vol, r.rel))
+            rows = [r._replace(presence=PRESENT) if (r.vol, r.rel) in scanned else r
+                    for r in current]
+            self._prune_superseded(rows)
+        self.presence_cache.clear()
         self.load_rows()
         self.refresh()
+
+    def _prune_superseded(self, rows):
+        """Quita del índice las rutas viejas sin borrar ni cambiar las notas."""
+        self.pruned_notice = ""
+        hidden, replacements = superseded_locations(rows)
+        if not hidden:
+            return 0
+        try:
+            removed, _updated = drop_superseded(hidden, replacements)
+        except sqlite3.Error as exc:
+            messagebox.showerror("No se pudo quitar la ruta vieja", str(exc))
+            return 0
+        if removed:
+            noun = ("ubicación anterior quitada" if removed == 1
+                    else "ubicaciones anteriores quitadas")
+            self.pruned_notice = f"{removed} {noun}; notas conservadas"
+        return removed
 
     # -- verificacion de disponibilidad --------------------------------------
     def _verify_if_hidden(self):
@@ -1034,6 +1262,7 @@ class App:
     def start_presence(self, force=False):
         if self.is_scanning() or self.is_verifying():
             return
+        self.pruned_notice = ""
         if force:
             self.presence_cache.clear()
             self.load_rows()
@@ -1057,6 +1286,13 @@ class App:
         self.presence_cache.update(results)
         self.load_rows()
         self.refresh()
+        if not cancelled:
+            # Con el estado completo sabemos cuál copia está comprobada: esa
+            # gana y la ruta vieja sale del índice. Si se canceló, no se toca.
+            self._prune_superseded(self.rows)
+            if self.pruned_notice:
+                self.load_rows()
+                self.refresh()
         scanning = self.is_scanning()
         if not scanning:
             self.hide_progress()
@@ -1069,6 +1305,8 @@ class App:
         dup = self.duplicate_detail()
         if dup:
             text += " " + dup
+        if self.pruned_notice:
+            text += " " + self.pruned_notice
         if not scanning:
             self.presence_status(2, f"{text}.  {self.summary}")
 
@@ -1204,7 +1442,7 @@ class App:
         self.master.clipboard_clear()
         self.master.clipboard_append("\n".join(r.path for r in rows))
 
-    # -- ruta completa --------------------------------------------------------
+    # -- ruta completa y ayuda ------------------------------------------------
     def on_tree_motion(self, event):
         """Muestra la ruta completa al pasar sobre la columna Carpeta."""
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -1227,48 +1465,24 @@ class App:
         except (ValueError, IndexError):
             self.hide_tooltip()
             return
-        if self.tip_row is row:
-            return
-        self.hide_tooltip()
-        self.tip_row = row
-        x, y = event.x_root, event.y_root
-        self.tip_after = self.master.after(300, lambda: self.show_tooltip(row, x, y))
+        self.tips.schedule(row, location_text(row), event.x_root, event.y_root)
 
     def show_tooltip(self, row, x, y):
-        if self.tip is not None:
-            self.tip.destroy()
-        self.tip_after = None
-        self.tip = tk.Toplevel(self.master)
-        self.tip.wm_overrideredirect(True)
-        label = tk.Label(
-            self.tip, text=location_text(row), justify="left", wraplength=520,
-            background="#ffffe0", relief="solid", bd=1, padx=6, pady=4,
-        )
-        label.pack()
-        self.tip.update_idletasks()
-        w, h = self.tip.winfo_width(), self.tip.winfo_height()
-        sx, sy = x + 14, y + 18
-        sw, sh = self.tip.winfo_screenwidth(), self.tip.winfo_screenheight()
-        if sx + w > sw:
-            sx = max(0, sw - w - 4)
-        if sy + h > sh:
-            sy = max(0, sh - h - 4)
-        self.tip.wm_geometry(f"+{sx}+{sy}")
+        self.tips.show(location_text(row), x, y)
 
     def hide_tooltip(self):
-        if self.tip_after is not None:
-            self.master.after_cancel(self.tip_after)
-            self.tip_after = None
-        if self.tip is not None:
-            self.tip.destroy()
-            self.tip = None
-        self.tip_row = None
+        self.tips.hide()
 
     def show_path_dialog(self):
         rows = self.selected_rows()
         if not rows:
             return
         PathDialog(self.master, rows[0])
+
+    def show_help(self):
+        """Abre la guía de primer uso y de usos posteriores."""
+        self.hide_tooltip()
+        HelpDialog(self.master)
 
     # -- eliminar -------------------------------------------------------------
     def delete_selected(self, permanent):

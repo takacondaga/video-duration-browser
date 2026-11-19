@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from vdb import database, presence
@@ -188,6 +189,53 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(
             dict(con.execute("SELECT key, note FROM notes").fetchall()),
             {"old": "nota", "new": "otra"},
+        )
+
+    # -- poda de ubicaciones superadas ----------------------------------------
+    def _add_two_copies_with_note(self, con):
+        con.execute(
+            "INSERT INTO volumes (id, ident, label, mount, kind, workers) "
+            "VALUES (1, 'C', 'C', 'C:\\', 'fixed', 4)")
+        con.execute(
+            "INSERT INTO volumes (id, ident, label, mount, kind, workers) "
+            "VALUES (2, 'F', 'F', 'F:\\', 'fixed', 4)")
+        con.executemany(
+            "INSERT INTO files (vol, rel, size, mtime, duration, fp, nkey) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(1, "a.mp4", 10, 1.0, 12.5, "fp-1", "key-1"),
+             (2, "a.mp4", 10, 1.0, 12.5, "fp-1", "key-1")],
+        )
+        con.execute(
+            "INSERT INTO notes (key, note, last_path, updated) "
+            "VALUES ('key-1', 'nota', 'C:\\a.mp4', 1.0)")
+        con.commit()
+
+    def test_drop_superseded_quita_fila_y_actualiza_last_path(self):
+        con = self.open()
+        self._add_two_copies_with_note(con)
+        gone = SimpleNamespace(vol=1, rel="a.mp4")
+        removed, updated = database.drop_superseded([gone], {"key-1": "F:\\a.mp4"})
+        self.assertEqual((removed, updated), (1, 1))
+        self.assertEqual(con.execute("SELECT vol, rel FROM files").fetchall(),
+                         [(2, "a.mp4")])
+        self.assertEqual(
+            con.execute("SELECT note, last_path FROM notes WHERE key = 'key-1'").fetchone(),
+            ("nota", "F:\\a.mp4"),
+        )
+
+    def test_drop_superseded_sin_argumentos_no_hace_nada(self):
+        self.assertEqual(database.drop_superseded([], {}), (0, 0))
+
+    def test_drop_superseded_hace_rollback_si_falla_la_nota(self):
+        con = self.open()
+        self._add_two_copies_with_note(con)
+        gone = SimpleNamespace(vol=1, rel="a.mp4")
+        with self.assertRaises(sqlite3.Error):
+            database.drop_superseded([gone], {"key-1": []})
+        self.assertEqual(con.execute("SELECT COUNT(*) FROM files").fetchone()[0], 2)
+        self.assertEqual(
+            con.execute("SELECT last_path FROM notes WHERE key = 'key-1'").fetchone()[0],
+            "C:\\a.mp4",
         )
 
     # -- extensiones ----------------------------------------------------------

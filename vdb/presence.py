@@ -25,16 +25,20 @@ def presence_blocked(state):
     return state in (MISSING, OFFLINE)
 
 
-def consolidate_rows(rows):
-    """Descarta copias no disponibles cuando existe una ubicacion comprobada.
+def superseded_locations(rows):
+    """Ubicaciones viejas de un mismo contenido, con su reemplazo.
 
     Agrupa por huella de contenido (``Row.key``), ignorando las claves ``path:``
-    que no son huellas reales. Si hay **una sola** fila PRESENTE, se conserva esa
-    y se ocultan las demas del grupo (Falta / Disco desconectado / Sin verificar).
-    Si hay varias PRESENTES son copias legitimas: se conservan todas. Si no hay
-    ninguna PRESENTE, no se descarta nada.
+    que no son huellas reales. Si hay **una sola** fila PRESENTE, esa gana y las
+    demas del grupo (Falta / Disco desconectado / Sin verificar) quedan
+    superadas. Si hay varias PRESENTES son copias legitimas: no se descarta
+    nada. Si no hay ninguna PRESENTE, tampoco.
 
-    Devuelve ``(visibles, ocultas)`` sin modificar la base ni las notas.
+    Devuelve ``(ocultas, reemplazos)``. ``reemplazos`` es ``{nkey: ruta_ganadora}``
+    y solo incluye grupos con algo superado, para no escribir la base de forma
+    innecesaria. Esta funcion es la unica fuente de verdad: la vista oculta
+    ``ocultas`` y la base borra esas mismas filas y apunta la nota a la ruta
+    ganadora. No modifica nada.
     """
     groups = {}
     for row in rows:
@@ -42,14 +46,28 @@ def consolidate_rows(rows):
         if key and not key.startswith("path:"):
             groups.setdefault(key, []).append(row)
     hidden = []
-    for group in groups.values():
+    replacements = {}
+    for key, group in groups.items():
         present = [r for r in group if r.presence == PRESENT]
         if len(present) != 1:
             continue
         winner = present[0]
-        for row in group:
-            if row is not winner and row.presence != PRESENT:
-                hidden.append(row)
+        others = [r for r in group if r is not winner and r.presence != PRESENT]
+        if not others:
+            continue
+        hidden.extend(others)
+        # Las filas reales siempre tienen `path`; el getattr mantiene la
+        # funcion usable con filas minimas en pruebas.
+        replacements[key] = getattr(winner, "path", "")
+    return hidden, replacements
+
+
+def consolidate_rows(rows):
+    """Oculta las copias superadas usando ``superseded_locations``.
+
+    Devuelve ``(visibles, ocultas)`` sin modificar la base ni las notas.
+    """
+    hidden, _replacements = superseded_locations(rows)
     if not hidden:
         return list(rows), []
     hidden_ids = {id(r) for r in hidden}
