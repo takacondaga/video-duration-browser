@@ -9,22 +9,25 @@ from unittest import mock
 try:
     import tkinter as tk
 
-    from vdb import database, ui
+    from vdb import __version__, database, theme, ui
     from vdb.presence import MISSING, OFFLINE, PRESENT, UNKNOWN
+    from vdb.volumes import VolInfo
 except ImportError:  # tkinter no instalado
     tk = None
-    database = ui = None
+    database = theme = ui = VolInfo = None
+    __version__ = ""
     MISSING = OFFLINE = PRESENT = UNKNOWN = None
 
 
-def make_row(name, state, online=None, key=None, disk=None, path=None, folder=None):
+def make_row(name, state, online=None, key=None, disk=None, path=None, folder=None,
+             created=None, modified=None):
     path = path or "C:\\videos\\" + name
     if online is None:
         online = state != OFFLINE
     return database.Row(
         path, name, folder or "C:\\videos", 100, 60.0, key or "key-" + name, "",
         path.lower(), "", path.lower(), 1, name, disk or "Disco (C:)",
-        online, "fixed", state, "C:\\",
+        online, "fixed", state, "C:\\", created, modified,
     )
 
 
@@ -45,6 +48,7 @@ class UiSmokeTest(unittest.TestCase):
                 mock.patch.object(ui, "fetch_rows", return_value=rows or []):
             app = ui.App(root)
         root.update_idletasks()
+        self._app = app
         return app
 
     def seed_moved_video(self):
@@ -154,6 +158,27 @@ class UiSmokeTest(unittest.TestCase):
             self.assertEqual([r.presence for r in app.view],
                              [PRESENT, MISSING, OFFLINE, UNKNOWN])
 
+    def test_columnas_de_fechas_y_orden(self):
+        rows = [
+            make_row("sin.mp4", PRESENT),
+            make_row("viejo.mp4", PRESENT, created=1000000000, modified=1100000000),
+            make_row("nuevo.mp4", PRESENT, created=1500000000, modified=1600000000),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp, rows)
+            self.assertEqual(len(app.tree["columns"]), 9)
+            self.assertEqual(app.tree.heading("created", "text"), "Creado")
+            self.assertEqual(app.tree.heading("modified", "text"), "Modificado")
+            values = [app.tree.item(iid, "values") for iid in app.tree.get_children()]
+            self.assertEqual(values[0][7], "—")
+            self.assertEqual(values[1][7], ui.fmt_date(1000000000))
+
+            app.sort_by("created")
+            self.assertEqual([r.name for r in app.view],
+                             ["nuevo.mp4", "viejo.mp4", "sin.mp4"])
+            app.sort_by("created")
+            self.assertEqual([r.name for r in app.view],
+                             ["viejo.mp4", "nuevo.mp4", "sin.mp4"])
 
     def test_leyenda_con_etapas_y_barra_de_progreso(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,6 +323,130 @@ class UiSmokeTest(unittest.TestCase):
             self.assertEqual(files, [(2, "video.mp4")])
             self.assertEqual(note, ("nota", "F:\\videos\\video.mp4"))
             self.assertIn("1 ubicación anterior quitada", app.pruned_notice)
+
+
+    def dialogo(self, title):
+        for win in self._app.master.winfo_children():
+            if hasattr(win, "title") and win.title() == title:
+                return win
+        return None
+
+    def test_version_y_herramientas_nuevas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp)
+            self.assertIn("v" + __version__, app.master.title())
+            labels = [app.menu.entrycget(i, "label")
+                      for i in range(int(app.menu.index("end")) + 1)
+                      if app.menu.type(i) == "command"]
+            for name in ("btn_duplicates", "btn_bulk", "cb_saved"):
+                self.assertIsNotNone(getattr(app, name))
+            cascades = [app.menubar.entrycget(i, "label")
+                        for i in range(int(app.menubar.index("end")) + 1)]
+            self.assertIn("Ver", cascades)
+            self.assertIn("Herramientas", cascades)
+
+    def test_vista_de_duplicados(self):
+        one = make_row("a.mp4", PRESENT, key="huella", path="C:\\videos\\a.mp4")
+        two = make_row("copia.mp4", PRESENT, key="huella",
+                       path="F:\\videos\\copia.mp4")
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp, [one, two])
+            app.show_duplicates()
+            dlg = self.dialogo("Videos duplicados")
+            self.assertIsNotNone(dlg)
+            self.assertEqual(len(dlg.groups), 1)
+            self.assertEqual(len(dlg.tree.get_children()), 1)
+            self.assertEqual(len(dlg.tree.get_children(dlg.tree.get_children()[0])), 2)
+            dlg.destroy()
+
+    def test_filtros_guardados_se_guardan_aplican_y_borran(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp)
+            app.search_var.set("drama")
+            app.scope_var.set("Solo notas")
+            app.hide_unavailable_var.set(True)
+            app.save_current_filter("Drama")
+            self.assertIn("Drama", ui.saved_filters.names(app.saved_filters))
+
+            con = database.open_db()
+            try:
+                stored = database.get_setting(
+                    con, ui.saved_filters.SETTING_NAME, {})
+            finally:
+                con.close()
+            self.assertEqual(stored["Drama"]["search"], "drama")
+
+            app.search_var.set("")
+            app.scope_var.set("Ruta y notas")
+            app.hide_unavailable_var.set(False)
+            self.assertTrue(app.apply_saved_filter("Drama"))
+            self.assertEqual(app.search_var.get(), "drama")
+            self.assertEqual(app.scope_var.get(), "Solo notas")
+            self.assertTrue(app.hide_unavailable_var.get())
+
+            app.delete_saved_filter("Drama")
+            self.assertEqual(app.saved_filters, {})
+            self.assertFalse(app.apply_saved_filter("Drama"))
+
+    def test_tema_oscuro_se_aplica_y_persiste(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self.open_app(tmp)
+            app.theme_var.set(True)
+            app.toggle_theme()
+            self.assertTrue(app.theme_dark)
+            self.assertEqual(str(app.tree.tag_configure("missing", "foreground")),
+                             theme.DARK["missing"])
+            con = database.open_db()
+            try:
+                self.assertIs(database.get_setting(con, "dark_theme"), True)
+            finally:
+                con.close()
+            app.theme_var.set(False)
+            app.toggle_theme()
+            self.assertFalse(app.theme_dark)
+
+    def test_renombrado_masivo_se_previsualiza_y_aplica(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Parchear DB_PATH antes de sembrar para no tocar la base real.
+            old_path = database.DB_PATH
+            database.DB_PATH = os.path.join(tmp, "videos_index.db")
+            self.addCleanup(setattr, database, "DB_PATH", old_path)
+            name = "a.mp4"
+            source = os.path.join(tmp, name)
+            with open(source, "wb"):
+                pass
+            con = database.open_db()
+            try:
+                vid = database.get_or_create_volume(
+                    con, VolInfo("C", "C", tmp, 0, "fixed"))
+                con.execute(
+                    "INSERT INTO files (vol, rel, size, mtime, duration, fp, nkey) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (vid, name, 1, 1.0, 60.0, "fp", "huella"))
+                con.commit()
+            finally:
+                con.close()
+            row = make_row(name, PRESENT, key="huella", path=source,
+                           folder=tmp)._replace(vol=vid, rel=name, mount=tmp)
+            app = self.open_app(tmp, [row])
+            app.tree.selection_set("0")
+            app.show_bulk()
+            dlg = self.dialogo("Renombrado y organización masiva")
+            self.assertIsNotNone(dlg)
+            dlg.tpl_var.set("{title} - nuevo")
+            dlg.preview_rename()
+            self.assertEqual(dlg.plans[0].new_rel, "a - nuevo.mp4")
+            self.assertIn("1 cambios listos", dlg.status_var.get())
+
+            with mock.patch.object(ui.messagebox, "askyesno", return_value=True):
+                dlg.apply()
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "a - nuevo.mp4")))
+            con = database.open_db()
+            try:
+                self.assertEqual(con.execute("SELECT rel FROM files").fetchall(),
+                                 [("a - nuevo.mp4",)])
+            finally:
+                con.close()
 
 
 if __name__ == "__main__":

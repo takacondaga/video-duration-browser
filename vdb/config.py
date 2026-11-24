@@ -1,6 +1,7 @@
 """Constantes y rutas de la aplicacion."""
 
 import os
+import sys
 
 NT = os.name == "nt"
 
@@ -24,7 +25,11 @@ PURGE_GUARD_MIN = 20           # con al menos este indice conocido...
 PURGE_GUARD_RATIO = 0.5        # ...no se purga si se encuentra menos de esta fraccion
 CREATE_NO_WINDOW = 0x08000000 if NT else 0
 
-# La base sigue viviendo junto al lanzador, no dentro del paquete.
-APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# La base sigue viviendo junto al lanzador, no dentro del paquete. En un .exe
+# el "lanzador" es el ejecutable, no la carpeta temporal de descompresion.
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(APP_DIR, "videos_index.db")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3

@@ -1,5 +1,6 @@
 """Esquema, migraciones y operaciones de la base de datos."""
 
+import json
 import os
 import shutil
 import sqlite3
@@ -20,7 +21,7 @@ from .volumes import DEFAULT_WORKERS, VolInfo, identify_volume
 Row = namedtuple(
     "Row",
     "path name folder size duration key note fpath fnote fall vol rel disk online "
-    "kind presence mount",
+    "kind presence mount created modified",
 )
 VolState = namedtuple("VolState", "id ident label mount online kind workers last_scan")
 Job = namedtuple("Job", "vol ident mount root_rel workers label")
@@ -47,7 +48,7 @@ def _create_schema(con):
         "CREATE TABLE IF NOT EXISTS files ("
         "vol INTEGER NOT NULL, rel TEXT NOT NULL, size INTEGER NOT NULL, "
         "mtime REAL NOT NULL, duration REAL NOT NULL, fp TEXT, nkey TEXT, "
-        "PRIMARY KEY (vol, rel))"
+        "created REAL, PRIMARY KEY (vol, rel))"
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_files_nkey ON files(nkey)")
 
@@ -225,6 +226,9 @@ def open_db():
                 con.execute("BEGIN IMMEDIATE")
                 try:
                     _create_schema(con)
+                    # v2 -> v3: la fecha de creacion no existia en la base vieja.
+                    if has_files and "created" not in cols:
+                        con.execute("ALTER TABLE files ADD COLUMN created REAL")
                     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     con.commit()
                 except Exception:
@@ -262,14 +266,15 @@ def fetch_rows(connected, presence=None):
     try:
         states = volume_states(con, connected)
         data = con.execute(
-            "SELECT f.vol, f.rel, f.size, f.duration, f.nkey, n.note "
+            "SELECT f.vol, f.rel, f.size, f.duration, f.nkey, n.note, "
+            "f.mtime, f.created "
             "FROM files f LEFT JOIN notes n ON n.key = f.nkey"
         ).fetchall()
     finally:
         con.close()
     presence = presence or {}
     rows = []
-    for vol, rel, size, duration, key, note in data:
+    for vol, rel, size, duration, key, note, mtime, created in data:
         st = states.get(vol)
         if st is None:
             continue
@@ -282,7 +287,7 @@ def fetch_rows(connected, presence=None):
         state = OFFLINE if not st.online else presence.get((vol, rel), UNKNOWN)
         rows.append(Row(path, name, folder, size, duration, key, note, fpath, fnote,
                         fpath + " " + fnote, vol, rel, disk, st.online, st.kind, state,
-                        st.mount))
+                        st.mount, created, mtime))
     return rows
 
 
@@ -385,6 +390,65 @@ def export_notes_to(con, filepath):
             path = path.replace("\t", " ").replace("\r", " ").replace("\n", " ")
             fh.write(f"{key}\t{clean_note(note)}\t{path}\n")
     return len(data)
+
+
+def get_setting(con, key, default=None):
+    """Lee un valor JSON de `meta`. Devuelve `default` si no existe o es invalido."""
+    row = con.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_setting(con, key, value):
+    """Guarda un valor JSON en `meta`."""
+    con.execute(
+        "INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)",
+        (key, json.dumps(value, ensure_ascii=False)),
+    )
+    con.commit()
+
+
+def relocate_files(changes):
+    """Actualiza la base despues de renombrar o mover archivos.
+
+    `changes` es una secuencia de ``(vol, old_rel, new_rel, key, new_path)``.
+    Todo se aplica en una sola transaccion: si alguna ruta destino ya existe o
+    alguna fila desaparecio, no se cambia nada. Las notas conservan su clave y
+    solo se actualiza la ultima ruta conocida.
+    """
+    records = [tuple(c) for c in changes]
+    if not records:
+        return 0
+    con = open_db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            for vol, old, new, key, path in records:
+                if con.execute(
+                    "SELECT 1 FROM files WHERE vol = ? AND rel = ?", (vol, new)
+                ).fetchone():
+                    raise ValueError(f"Ya existe la ruta {new} en el índice")
+                cur = con.execute(
+                    "UPDATE files SET rel = ? WHERE vol = ? AND rel = ?", (new, vol, old)
+                )
+                if cur.rowcount != 1:
+                    raise ValueError(f"No se encontró la ruta {old} en el índice")
+                if key:
+                    con.execute(
+                        "UPDATE notes SET last_path = ?, updated = ? WHERE key = ?",
+                        (path, time.time(), key),
+                    )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+    finally:
+        con.close()
+    return len(records)
 
 
 def import_notes_from(con, filepath):

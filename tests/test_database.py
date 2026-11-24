@@ -40,11 +40,12 @@ class DatabaseTestCase(unittest.TestCase):
         return database.get_or_create_volume(con, info)
 
     def add_file(self, con, vid, rel, size=10, mtime=100.0, duration=12.5,
-                 fp="fp-1", nkey="key-1"):
+                 fp="fp-1", nkey="key-1", created=None):
         con.execute(
-            "INSERT OR REPLACE INTO files (vol, rel, size, mtime, duration, fp, nkey) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (vid, rel, size, mtime, duration, fp, nkey),
+            "INSERT OR REPLACE INTO files "
+            "(vol, rel, size, mtime, duration, fp, nkey, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (vid, rel, size, mtime, duration, fp, nkey, created),
         )
         con.commit()
 
@@ -69,6 +70,31 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(con.execute("SELECT COUNT(*) FROM meta").fetchone()[0], 1)
         self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0],
                          database.SCHEMA_VERSION)
+
+    def test_migracion_v2_a_v3_agrega_created(self):
+        con = sqlite3.connect(self.db_path)
+        try:
+            con.execute(
+                "CREATE TABLE files (vol INTEGER NOT NULL, rel TEXT NOT NULL, "
+                "size INTEGER NOT NULL, mtime REAL NOT NULL, duration REAL NOT NULL, "
+                "fp TEXT, nkey TEXT, PRIMARY KEY (vol, rel))")
+            con.execute("PRAGMA user_version = 2")
+            con.commit()
+        finally:
+            con.close()
+        con = self.open()
+        cols = {r[1] for r in con.execute("PRAGMA table_info(files)")}
+        self.assertIn("created", cols)
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0],
+                         database.SCHEMA_VERSION)
+
+    def test_fetch_rows_expone_creacion_y_modificacion(self):
+        con = self.open()
+        vid = self.add_volume(con)
+        self.add_file(con, vid, "a.mp4", mtime=200.0, created=100.0)
+        row = database.fetch_rows({})[0]
+        self.assertEqual(row.created, 100.0)
+        self.assertEqual(row.modified, 200.0)
 
     # -- volumenes y trabajos -------------------------------------------------
     def test_get_or_create_volume_actualiza_sin_duplicar(self):
@@ -406,6 +432,72 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(mount, root)
         self.assertEqual(
             con.execute("SELECT rel FROM files").fetchone()[0], "b.mp4")
+
+
+class SettingsAndRelocateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+        self._old_db_path = database.DB_PATH
+        database.DB_PATH = os.path.join(self.tmp, "videos_index.db")
+        self.addCleanup(setattr, database, "DB_PATH", self._old_db_path)
+
+    def open(self):
+        con = database.open_db()
+        self.addCleanup(con.close)
+        return con
+
+    def add_volume(self, con, ident="VOL1"):
+        info = VolInfo(ident, "Disco", self.tmp, 0, "fixed")
+        return database.get_or_create_volume(con, info)
+
+    def add_file(self, con, vid, rel, nkey="key-1"):
+        con.execute(
+            "INSERT INTO files (vol, rel, size, mtime, duration, fp, nkey) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", (vid, rel, 10, 1.0, 12.5, "fp", nkey))
+        con.commit()
+
+    def test_setting_json_hace_roundtrip_y_tolerda_valor_invalido(self):
+        con = self.open()
+        self.assertIsNone(database.get_setting(con, "missing"))
+        self.assertEqual(database.get_setting(con, "missing", 42), 42)
+        database.set_setting(con, "filtros", {"a": [1, "ñ"], "b": True})
+        self.assertEqual(database.get_setting(con, "filtros"),
+                         {"a": [1, "ñ"], "b": True})
+        con.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('roto', '{no json')")
+        con.commit()
+        self.assertEqual(database.get_setting(con, "roto", "por defecto"), "por defecto")
+
+    def test_relocate_files_actualiza_rutas_y_conserva_notas(self):
+        con = self.open()
+        vid = self.add_volume(con)
+        self.add_file(con, vid, "videos/a.mp4", nkey="huella")
+        con.execute(
+            "INSERT INTO notes (key, note, last_path, updated) VALUES (?, ?, ?, ?)",
+            ("huella", "nota", os.path.join(self.tmp, "videos", "a.mp4"), 1.0))
+        con.commit()
+        new_path = os.path.join(self.tmp, "dest", "a.mp4")
+        changed = database.relocate_files([(vid, "videos/a.mp4", "dest/a.mp4",
+                                           "huella", new_path)])
+        self.assertEqual(changed, 1)
+        self.assertEqual(con.execute("SELECT rel FROM files").fetchall(),
+                         [("dest/a.mp4",)])
+        self.assertEqual(con.execute("SELECT note, last_path FROM notes").fetchone(),
+                         ("nota", new_path))
+
+    def test_relocate_files_no_deja_cambios_parciales(self):
+        con = self.open()
+        vid = self.add_volume(con)
+        self.add_file(con, vid, "a.mp4")
+        self.add_file(con, vid, "b.mp4")
+        with self.assertRaises(ValueError):
+            database.relocate_files([
+                (vid, "a.mp4", "c.mp4", None, "c.mp4"),
+                (vid, "b.mp4", "c.mp4", None, "c.mp4"),
+            ])
+        self.assertEqual({r[0] for r in con.execute("SELECT rel FROM files")},
+                         {"a.mp4", "b.mp4"})
 
 
 if __name__ == "__main__":

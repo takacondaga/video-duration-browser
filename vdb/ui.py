@@ -9,14 +9,19 @@ import time
 from collections import Counter
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from . import __version__, theme
+from . import filters as saved_filters
+from .bulkops import execute_changes, plan_move, plan_rename
 from .config import DEFAULT_VIDEO_EXT, MAX_ROWS_SHOWN, NT
 from .database import (
     Job, add_root, build_jobs, drop_superseded, export_notes_to, fetch_rows,
-    get_or_create_volume, import_notes_from, load_extensions, open_db,
-    remove_file_records, save_extensions, save_notes, volume_states,
+    get_or_create_volume, get_setting, import_notes_from, load_extensions, open_db,
+    relocate_files, remove_file_records, save_extensions, save_notes, set_setting,
+    volume_states,
 )
+from .duplicates import duplicate_groups, duplicate_stats
 from .fileops import delete_permanently, send_to_trash
 from .paths import disk_text, display_path, ncase, rel_of
 from .presence import (
@@ -25,8 +30,8 @@ from .presence import (
 )
 from .scan import definitely_missing, find_ffprobe, root_alive, scan_worker
 from .text import (
-    clean_note, fold, fmt_dur, fmt_size, fmt_ts, merge_tags, parse_ext_list,
-    parse_minutes, remove_tags, tag_index,
+    clean_note, fold, fmt_date, fmt_dur, fmt_size, fmt_ts, merge_tags,
+    parse_ext_list, parse_minutes, remove_tags, tag_index,
 )
 from .volumes import DEFAULT_WORKERS, identify_volume, list_connected_volumes
 
@@ -35,7 +40,8 @@ from .volumes import DEFAULT_WORKERS, identify_volume, list_connected_volumes
 # Interfaz
 # ----------------------------------------------------------------------------
 
-COLS = ("name", "duration", "size", "notes", "disk", "presence", "folder")
+COLS = ("name", "duration", "size", "notes", "disk", "presence", "folder",
+        "created", "modified")
 HEADINGS = {
     "name": "Nombre",
     "duration": "Duración",
@@ -44,7 +50,16 @@ HEADINGS = {
     "disk": "Disco",
     "presence": "Estado",
     "folder": "Carpeta",
+    "created": "Creado",
+    "modified": "Modificado",
 }
+
+
+def _date_key(ts):
+    """Los NONE se recolocan al final después de ordenar (ver `refresh`)."""
+    return float(ts or 0)
+
+
 SORT_KEYS = {
     "name": lambda r: r.name.lower(),
     "duration": lambda r: r.duration,
@@ -53,8 +68,11 @@ SORT_KEYS = {
     "disk": lambda r: r.disk.lower(),
     "presence": lambda r: PRESENCE_ORDER.get(r.presence, len(PRESENCE_ORDER)),
     "folder": lambda r: r.folder.lower(),
+    "created": lambda r: _date_key(r.created),
+    "modified": lambda r: _date_key(r.modified),
 }
-NUMERIC_COLS = {"duration", "size"}
+NUMERIC_COLS = {"duration", "size", "created", "modified"}
+DATE_COLS = {"created", "modified"}
 SCOPES = ("Ruta y notas", "Solo notas", "Solo ruta")
 NOTE_FILTERS = ("Todos", "Con nota", "Sin nota")
 SCAN_STAGES = (
@@ -95,6 +113,9 @@ WIDGET_TIPS = {
     "min_duration": "Duración mínima en minutos (dejar vacío para no filtrar).",
     "max_duration": "Duración máxima en minutos (dejar vacío para no filtrar).",
     "hide_unavailable": "Esconde Falta y Disco desconectado y lanza la verificación.",
+    "duplicates": "Agrupa los videos con la misma huella de contenido.",
+    "bulk": "Renombra o mueve varios videos a la vez, con vista previa.",
+    "saved_filter": "Guarda la combinación actual de filtros para volver a usarla.",
 }
 
 HELP_TEXT = """PRIMER USO
@@ -124,6 +145,18 @@ Si el mismo video aparece en otra ubicación, se conserva la copia presente:
 la ruta vieja se quita del índice, se actualiza la ruta guardada en la nota
 y el texto de la nota se mantiene. Si ambas copias están presentes, se
 conservan las dos. Al terminar una verificación cancelada no se quita nada.
+
+HERRAMIENTAS
+
+- Duplicados…: agrupa los videos con la misma huella de contenido para que
+  decidas cuál conservar. No borra ni mueve nada por su cuenta.
+- Renombrado masivo…: previsualiza los cambios antes de aplicarlos. Nunca
+  sobrescribe archivos y revierte los renombrados si falla la base de datos.
+- Filtros guardados: elegí un nombre en el combo «Filtros Guardados» para
+  volver a aplicar la combinación de búsqueda, notas y ocultar no
+  disponibles. Se guardan en la base de datos local.
+- Ver → Tema oscuro: cambia los colores de la interfaz y recuerda la
+  elección entre sesiones.
 """
 
 
@@ -599,10 +632,341 @@ class PathDialog(tk.Toplevel):
         self.master.clipboard_append(self.row.path)
 
 
+class DuplicatesDialog(tk.Toplevel):
+    """Vista de duplicados agrupados por la huella calculada en el escaneo."""
+
+    def __init__(self, app):
+        super().__init__(app.master)
+        self.app = app
+        self.groups = duplicate_groups(app.rows)
+        self.rows_by_iid = {}
+        self.title("Videos duplicados")
+        self.transient(app.master)
+        self.geometry("960x520")
+
+        ngroups, extra, wasted = duplicate_stats(self.groups)
+        top = ttk.Frame(self, padding=(8, 8, 8, 0))
+        top.pack(fill="x")
+        ttk.Label(
+            top,
+            text=(f"{ngroups} grupos, {extra} copias repetidas, {fmt_size(wasted)} "
+                  "recuperables. Agrupados por contenido, no por nombre."),
+        ).pack(anchor="w")
+
+        frame = ttk.Frame(self, padding=(8, 4, 8, 0))
+        frame.pack(fill="both", expand=True)
+        cols = ("name", "copies", "size", "duration", "path")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        spec = (
+            ("name", "Nombre", 240, "w"), ("copies", "Copias", 70, "e"),
+            ("size", "Tamaño", 100, "e"), ("duration", "Duración", 90, "e"),
+            ("path", "Ruta", 420, "w"),
+        )
+        for col, title, width, anchor in spec:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor=anchor, stretch=(col == "path"))
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.tag_configure("group", font=("TkDefaultFont", 9, "bold"))
+        self.tree.tag_configure("error", foreground=theme.palette(app.theme_dark)["missing"])
+
+        for gi, group in enumerate(self.groups):
+            gid = f"g{gi}"
+            self.tree.insert(
+                "", "end", iid=gid, tags=("group",),
+                values=(group.rows[0].name, len(group.rows), fmt_size(group.size),
+                        fmt_dur(group.duration), ""),
+            )
+            for ri, row in enumerate(group.rows):
+                iid = f"g{gi}r{ri}"
+                self.rows_by_iid[iid] = row
+                self.tree.insert(
+                    gid, "end", iid=iid,
+                    values=(row.name, "", fmt_size(row.size), fmt_dur(row.duration),
+                            row.path),
+                )
+
+        bf = ttk.Frame(self, padding=(8, 8))
+        bf.pack(fill="x")
+        ttk.Button(bf, text="Ver en carpeta", command=self.show_folder).pack(side="left")
+        ttk.Button(bf, text="Copiar rutas", command=self.copy_paths).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(bf, text="Cerrar", command=self.destroy).pack(side="right")
+        theme.apply_theme(self, app.theme_dark)
+
+    def selected_rows(self):
+        out = []
+        for iid in self.tree.selection():
+            if iid in self.rows_by_iid:
+                out.append(self.rows_by_iid[iid])
+            else:
+                out.extend(self.rows_by_iid[k] for k in self.tree.get_children(iid))
+        return out
+
+    def show_folder(self):
+        rows = self.selected_rows()
+        if not rows:
+            messagebox.showinfo("Sin selección", "Seleccionar un grupo o un video.")
+            return
+        row = rows[0]
+        if not row.online:
+            messagebox.showinfo("Disco desconectado",
+                                f"Conectar el disco '{row.disk}' para ver el archivo.")
+            return
+        try:
+            if NT:
+                subprocess.Popen(f'explorer /select,"{row.path}"')
+            else:
+                subprocess.Popen(["xdg-open", row.folder])
+        except OSError as e:
+            messagebox.showerror("No se pudo abrir la carpeta", str(e))
+
+    def copy_paths(self):
+        rows = self.selected_rows()
+        if not rows:
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(r.path for r in rows))
+
+
+class BulkDialog(tk.Toplevel):
+    """Renombrado y movimiento masivo con vista previa antes de aplicar."""
+
+    def __init__(self, app, rows):
+        super().__init__(app.master)
+        self.app = app
+        self.rows = list(rows)
+        self.plans = []
+        self.active = "rename"
+        self.title("Renombrado y organización masiva")
+        self.transient(app.master)
+        self.geometry("920x560")
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        ren = ttk.Frame(nb, padding=8)
+        mov = ttk.Frame(nb, padding=8)
+        nb.add(ren, text="Renombrar")
+        nb.add(mov, text="Mover a carpeta")
+        nb.bind("<<NotebookTabChanged>>", lambda _e: self.on_tab(nb))
+
+        ttk.Label(
+            ren,
+            text=("Plantillas: {name}, {title}, {index}, {duration}, {created}, {folder}. "
+                  "La extensión se conserva siempre."),
+            wraplength=860, justify="left",
+        ).pack(anchor="w")
+        self.tpl_var = tk.StringVar(value="{title}")
+        ttk.Entry(ren, textvariable=self.tpl_var).pack(fill="x", pady=(4, 2))
+        sf = ttk.Frame(ren)
+        sf.pack(fill="x")
+        ttk.Label(sf, text="Numerar desde:").pack(side="left")
+        self.start_var = tk.StringVar(value="1")
+        ttk.Entry(sf, textvariable=self.start_var, width=6).pack(side="left", padx=(4, 10))
+        ttk.Button(sf, text="Previsualizar", command=self.preview_rename).pack(side="left")
+        self.ren_tree = self.make_tree(ren)
+
+        ttk.Label(
+            mov,
+            text=("Mueve los videos a una carpeta del mismo disco. La subcarpeta "
+                  "admite las mismas plantillas; se crea si no existe."),
+            wraplength=860, justify="left",
+        ).pack(anchor="w")
+        df = ttk.Frame(mov)
+        df.pack(fill="x", pady=(8, 0))
+        ttk.Label(df, text="Carpeta destino:").pack(side="left")
+        self.dest_var = tk.StringVar(
+            value=os.path.dirname(self.rows[0].path) if self.rows else "")
+        ttk.Entry(df, textvariable=self.dest_var).pack(
+            side="left", fill="x", expand=True, padx=(4, 6))
+        ttk.Button(df, text="Examinar…", command=self.pick_folder).pack(side="left")
+        ttk.Label(mov, text="Subcarpeta (opcional):").pack(anchor="w", pady=(8, 0))
+        self.sub_var = tk.StringVar(value="")
+        ttk.Entry(mov, textvariable=self.sub_var).pack(fill="x", pady=(2, 4))
+        ttk.Button(mov, text="Previsualizar", command=self.preview_move).pack(anchor="w")
+        self.mov_tree = self.make_tree(mov)
+
+        bf = ttk.Frame(self, padding=8)
+        bf.pack(fill="x")
+        self.status_var = tk.StringVar(
+            value=f"{len(self.rows)} videos seleccionados")
+        ttk.Label(bf, textvariable=self.status_var).pack(side="left")
+        ttk.Button(bf, text="Aplicar", command=self.apply).pack(side="right")
+        ttk.Button(bf, text="Cerrar", command=self.destroy).pack(side="right", padx=(0, 6))
+        theme.apply_theme(self, app.theme_dark)
+        if self.rows:
+            self.preview_rename()
+
+    def make_tree(self, parent):
+        holder = ttk.Frame(parent)
+        holder.pack(fill="both", expand=True, pady=(6, 0))
+        tree = ttk.Treeview(holder, columns=("old", "new", "state"), show="headings")
+        tree.heading("old", text="Ruta actual")
+        tree.heading("new", text="Ruta nueva")
+        tree.heading("state", text="Estado")
+        tree.column("old", width=300)
+        tree.column("new", width=300)
+        tree.column("state", width=150)
+        sb = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        tree.tag_configure("error", foreground=theme.palette(self.app.theme_dark)["missing"])
+        return tree
+
+    def on_tab(self, nb):
+        self.active = "move" if nb.index(nb.select()) == 1 else "rename"
+
+    def pick_folder(self):
+        folder = filedialog.askdirectory(
+            mustexist=True, title="Carpeta destino (en el mismo disco)")
+        if folder:
+            self.dest_var.set(os.path.normpath(folder))
+
+    def occupied(self):
+        vols = {r.vol for r in self.rows}
+        out = {}
+        con = open_db()
+        try:
+            for vol in vols:
+                out[vol] = {rel for (rel,) in con.execute(
+                    "SELECT rel FROM files WHERE vol = ?", (vol,))}
+        finally:
+            con.close()
+        return out
+
+    def preview_rename(self):
+        self.active = "rename"
+        try:
+            start = int(self.start_var.get())
+        except ValueError:
+            start = 1
+        self.plans = plan_rename(self.rows, self.tpl_var.get(), self.occupied(), start)
+        self.fill_tree(self.ren_tree, self.plans)
+
+    def preview_move(self):
+        dest = os.path.normpath(self.dest_var.get())
+        if not dest or not os.path.isdir(dest):
+            self.plans = []
+            self.status_var.set("La carpeta destino no existe.")
+            return
+        self.active = "move"
+        self.plans = plan_move(self.rows, dest, self.sub_var.get(), self.occupied())
+        self.fill_tree(self.mov_tree, self.plans)
+
+    def fill_tree(self, tree, plans):
+        tree.delete(*tree.get_children())
+        for i, ch in enumerate(plans):
+            state = ch.error or ("listo" if ch.new_rel != ch.old_rel else "sin cambios")
+            tree.insert("", "end", iid=str(i),
+                        values=(ch.old_rel, ch.new_rel, state),
+                        tags=("error",) if ch.error else ())
+        good = sum(1 for ch in plans if not ch.error and ch.new_rel != ch.old_rel)
+        self.status_var.set(f"{good} cambios listos, {len(plans) - good} sin aplicar")
+
+    def apply(self):
+        plans = [c for c in self.plans if not c.error and c.new_rel != c.old_rel]
+        if not plans:
+            messagebox.showinfo("Sin cambios", "No hay cambios válidos para aplicar.")
+            return
+        if not messagebox.askyesno(
+            "Confirmar cambios",
+            f"Se modificarán {len(plans)} archivos y sus rutas en el índice.\n"
+            "Las notas se conservan. ¿Continuar?",
+            icon="warning", default="no",
+        ):
+            return
+        try:
+            done, failed = execute_changes(plans, relocate_files)
+        except (OSError, ValueError, sqlite3.Error) as e:
+            messagebox.showerror("No se pudieron aplicar los cambios", str(e))
+            self.app.load_rows()
+            self.app.refresh()
+            return
+        self.app.load_rows()
+        self.app.refresh()
+        self.status_var.set(f"{len(done)} cambios aplicados, {len(failed)} fallidos")
+        if failed:
+            detail = "\n".join(f"{c.old_rel}: {c.error}" for c in failed[:10])
+            messagebox.showwarning("Algunos cambios no se aplicaron", detail)
+        else:
+            self.destroy()
+
+
+class SavedFiltersDialog(tk.Toplevel):
+    """Guarda, aplica y borra combinaciones de filtros de la barra superior."""
+
+    def __init__(self, app):
+        super().__init__(app.master)
+        self.app = app
+        self.title("Filtros guardados")
+        self.transient(app.master)
+        self.geometry("440x420")
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Nombre del filtro:").pack(anchor="w")
+        self.name_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.name_var).pack(fill="x", pady=(2, 8))
+        lf = ttk.Frame(frm)
+        lf.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(lf, exportselection=False)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.listbox.bind("<Double-1>", lambda _e: self.apply())
+
+        bf = ttk.Frame(frm)
+        bf.pack(fill="x", pady=(8, 0))
+        ttk.Button(bf, text="Guardar actual", command=self.store).pack(side="left")
+        ttk.Button(bf, text="Aplicar", command=self.apply).pack(side="left", padx=(6, 0))
+        ttk.Button(bf, text="Borrar", command=self.delete).pack(side="left", padx=(6, 0))
+        ttk.Button(bf, text="Cerrar", command=self.destroy).pack(side="right")
+        self.reload()
+        theme.apply_theme(self, app.theme_dark)
+
+    def reload(self):
+        self.names = saved_filters.names(self.app.saved_filters)
+        self.listbox.delete(0, "end")
+        for name in self.names:
+            self.listbox.insert("end", name)
+
+    def selected(self):
+        sel = self.listbox.curselection()
+        return self.names[sel[0]] if sel else None
+
+    def store(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Sin nombre", "Escribir un nombre para el filtro.")
+            return
+        self.app.save_current_filter(name)
+        self.reload()
+
+    def apply(self):
+        name = self.selected() or self.name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Sin selección", "Elegir un filtro guardado.")
+            return
+        if self.app.apply_saved_filter(name):
+            self.destroy()
+
+    def delete(self):
+        name = self.selected()
+        if not name:
+            messagebox.showinfo("Sin selección", "Elegir un filtro guardado.")
+            return
+        self.app.delete_saved_filter(name)
+        self.reload()
+
+
 class App:
     def __init__(self, master):
         self.master = master
-        master.title("Videos por duración")
+        master.title(f"Videos por duración v{__version__}")
         master.geometry("1350x700")
 
         self.ffprobe = find_ffprobe()
@@ -629,6 +993,7 @@ class App:
         self.max_var = tk.StringVar()
         self.retry_var = tk.BooleanVar(value=False)
         self.hide_unavailable_var = tk.BooleanVar(value=False)
+        self.saved_filter_var = tk.StringVar()
         self.status_var = tk.StringVar()
         self.scan_stage = 0
         self.scan_job_index = 0
@@ -638,8 +1003,21 @@ class App:
         self.pruned_notice = ""
         self.scan_jobs = []
         self.tips = TipManager(master)
+        self.theme_dark = False
+        self.saved_filters = {}
+        try:
+            con = open_db()
+            try:
+                self.theme_dark = bool(get_setting(con, "dark_theme", False))
+                self.saved_filters = saved_filters.clean_saved(
+                    get_setting(con, saved_filters.SETTING_NAME, {}))
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
 
         self._build_ui()
+        theme.apply_theme(master, self.theme_dark)
         self.refresh_connected()
         self.load_rows()
         self.refresh()
@@ -679,7 +1057,7 @@ class App:
 
     # -- construccion ---------------------------------------------------------
     def _build_ui(self):
-        menubar = tk.Menu(self.master)
+        menubar = self.menubar = tk.Menu(self.master)
         notes_menu = tk.Menu(menubar, tearoff=0)
         notes_menu.add_command(label="Anotar selección…", accelerator="F2",
                                command=self.annotate_selected)
@@ -694,8 +1072,22 @@ class App:
         index_menu.add_separator()
         index_menu.add_command(label="Limpiar inexistentes…", command=self.clean_missing)
         menubar.add_cascade(label="Índice", menu=index_menu)
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(label="Filtros guardados…", command=self.show_saved_filters)
+        view_menu.add_separator()
+        self.theme_var = tk.BooleanVar(value=self.theme_dark)
+        view_menu.add_checkbutton(label="Tema oscuro", variable=self.theme_var,
+                                  command=self.toggle_theme)
+        menubar.add_cascade(label="Ver", menu=view_menu)
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Videos duplicados…", command=self.show_duplicates)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Renombrado / organización masiva…",
+                               command=self.show_bulk)
+        menubar.add_cascade(label="Herramientas", menu=tools_menu)
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="Primer uso…", command=self.show_help)
+        help_menu.add_command(label="Acerca de…", command=self.show_about)
         menubar.add_cascade(label="Ayuda", menu=help_menu)
         self.master.config(menu=menubar)
 
@@ -763,22 +1155,37 @@ class App:
         ):
             self.tips.bind(widget, tip)
 
+        tools = ttk.Frame(self.master, padding=(8, 0, 8, 4))
+        tools.pack(fill="x")
+        self.btn_duplicates = ttk.Button(tools, text="Duplicados…",
+                                         command=self.show_duplicates)
+        self.btn_duplicates.pack(side="left")
+        self.btn_bulk = ttk.Button(tools, text="Renombrado masivo…",
+                                   command=self.show_bulk)
+        self.btn_bulk.pack(side="left", padx=(6, 0))
+        ttk.Label(tools, text="Filtro guardado:").pack(side="left", padx=(24, 4))
+        self.cb_saved = ttk.Combobox(tools, textvariable=self.saved_filter_var,
+                                     values=saved_filters.names(self.saved_filters),
+                                     state="readonly", width=18)
+        self.cb_saved.pack(side="left")
+        self.cb_saved.bind("<<ComboboxSelected>>",
+                           lambda _e: self.apply_saved_filter())
+        ttk.Button(tools, text="Filtros…", command=self.show_saved_filters).pack(
+            side="left", padx=(6, 0))
+        for widget, tip in (
+            (self.btn_duplicates, WIDGET_TIPS["duplicates"]),
+            (self.btn_bulk, WIDGET_TIPS["bulk"]),
+            (self.cb_saved, WIDGET_TIPS["saved_filter"]),
+        ):
+            self.tips.bind(widget, tip)
+
         mid = ttk.Frame(self.master, padding=(8, 0, 8, 0))
         mid.pack(fill="both", expand=True)
 
-        # Correccion conocida de Tk 8.6.9: ignora los colores de fila en Treeview.
-        style = ttk.Style()
-
-        def fixed_map(option):
-            return [e for e in style.map("Treeview", query_opt=option)
-                    if e[:2] != ("!disabled", "!selected")]
-
-        style.map("Treeview", foreground=fixed_map("foreground"),
-                  background=fixed_map("background"))
-
         self.tree = ttk.Treeview(mid, columns=COLS, show="headings", selectmode="extended")
         widths = {"name": 320, "duration": 90, "size": 100, "notes": 260,
-                  "disk": 150, "presence": 140, "folder": 340}
+                  "disk": 150, "presence": 140, "folder": 340,
+                  "created": 140, "modified": 140}
         for col in COLS:
             self.tree.heading(col, text=HEADINGS[col], command=lambda c=col: self.sort_by(c))
             # Anchos fijos: si las columnas se estiran, al maximizar la ventana
@@ -787,8 +1194,9 @@ class App:
                 col, width=widths[col], stretch=False,
                 anchor="e" if col in NUMERIC_COLS else "w",
             )
-        self.tree.tag_configure("offline", foreground="#8a8a8a")
-        self.tree.tag_configure("missing", foreground="#b03a2e")
+        colors = theme.palette(self.theme_dark)
+        self.tree.tag_configure("offline", foreground=colors["offline"])
+        self.tree.tag_configure("missing", foreground=colors["missing"])
         self.vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.hsb = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
@@ -917,6 +1325,11 @@ class App:
         out, self.duplicate_hidden = consolidate_rows(out)
 
         out.sort(key=SORT_KEYS[self.sort_key], reverse=self.sort_desc)
+        if self.sort_key in DATE_COLS:
+            # Las fechas desconocidas van al final en ambos sentidos.
+            known = [r for r in out if getattr(r, self.sort_key) is not None]
+            unknown = [r for r in out if getattr(r, self.sort_key) is None]
+            out = known + unknown
 
         total_size = sum(r.size for r in out)
         total_dur = sum(r.duration for r in out if r.duration >= 0)
@@ -937,7 +1350,8 @@ class App:
             self.tree.insert(
                 "", "end", iid=str(i),
                 values=(r.name, fmt_dur(r.duration), fmt_size(r.size), r.note, r.disk,
-                        presence_label(r.presence), r.folder),
+                        presence_label(r.presence), r.folder,
+                        fmt_date(r.created), fmt_date(r.modified)),
                 tags=tags,
             )
 
@@ -1483,6 +1897,102 @@ class App:
         """Abre la guía de primer uso y de usos posteriores."""
         self.hide_tooltip()
         HelpDialog(self.master)
+
+    def show_about(self):
+        messagebox.showinfo(
+            "Acerca de",
+            f"Video Duration Browser v{__version__}\n\n"
+            "Indexador de videos con notas asociadas al contenido.\n"
+            "Python, Tkinter y ffprobe.",
+        )
+
+    # -- duplicados -----------------------------------------------------------
+    def show_duplicates(self):
+        self.hide_tooltip()
+        DuplicatesDialog(self)
+
+    # -- lotes ----------------------------------------------------------------
+    def show_bulk(self):
+        rows = self.selected_rows() or list(self.view)
+        if not rows:
+            messagebox.showinfo("Sin selección", "No hay videos en la vista.")
+            return
+        BulkDialog(self, rows)
+
+    # -- filtros guardados ----------------------------------------------------
+    def show_saved_filters(self):
+        SavedFiltersDialog(self)
+
+    def current_filter(self):
+        return saved_filters.normalize({
+            "search": self.search_var.get(),
+            "scope": self.scope_var.get(),
+            "notes": self.notes_filter_var.get(),
+            "min": self.min_var.get(),
+            "max": self.max_var.get(),
+            "hide_unavailable": self.hide_unavailable_var.get(),
+        })
+
+    def persist_saved_filters(self):
+        try:
+            con = open_db()
+            try:
+                set_setting(con, saved_filters.SETTING_NAME, self.saved_filters)
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            messagebox.showerror("No se pudieron guardar los filtros", str(e))
+
+    def reload_saved_filters(self):
+        values = saved_filters.names(self.saved_filters)
+        self.cb_saved.configure(values=values)
+        if self.saved_filter_var.get() not in values:
+            self.saved_filter_var.set("")
+
+    def save_current_filter(self, name):
+        self.saved_filters = saved_filters.save(
+            self.saved_filters, name, self.current_filter())
+        self.persist_saved_filters()
+        self.reload_saved_filters()
+        self.status_var.set(f"Filtro '{name}' guardado.")
+
+    def apply_saved_filter(self, name=None):
+        name = name if name is not None else self.saved_filter_var.get()
+        data = self.saved_filters.get(name)
+        if data is None:
+            return False
+        self.search_var.set(data["search"])
+        self.scope_var.set(data["scope"])
+        self.notes_filter_var.set(data["notes"])
+        self.min_var.set(data["min"])
+        self.max_var.set(data["max"])
+        self.hide_unavailable_var.set(data["hide_unavailable"])
+        self.saved_filter_var.set(name)
+        self.refresh()
+        self._verify_if_hidden()
+        self.status_var.set(f"Filtro '{name}' aplicado.")
+        return True
+
+    def delete_saved_filter(self, name):
+        self.saved_filters = saved_filters.remove(self.saved_filters, name)
+        self.persist_saved_filters()
+        self.reload_saved_filters()
+        self.status_var.set(f"Filtro '{name}' borrado.")
+
+    # -- tema -----------------------------------------------------------------
+    def toggle_theme(self):
+        self.theme_dark = bool(self.theme_var.get())
+        p = theme.apply_theme(self.master, self.theme_dark)
+        self.tree.tag_configure("offline", foreground=p["offline"])
+        self.tree.tag_configure("missing", foreground=p["missing"])
+        try:
+            con = open_db()
+            try:
+                set_setting(con, "dark_theme", self.theme_dark)
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            messagebox.showerror("No se pudo guardar el tema", str(e))
 
     # -- eliminar -------------------------------------------------------------
     def delete_selected(self, permanent):

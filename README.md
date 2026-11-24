@@ -18,6 +18,9 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
 - Columna **Estado** que indica si cada archivo está `Presente`, `Falta`, en
   un `Disco desconectado` o `Sin verificar`, con un filtro para ocultar los no
   disponibles.
+- Columnas **Creado** y **Modificado** con las fechas del sistema de archivos
+  de cada video, ordenables en ambos sentidos; las desconocidas se muestran
+  como `—`.
 - Tabla principal con barras de desplazamiento vertical y horizontal, para ver
   todas las columnas aunque la ventana sea angosta. Los anchos de columna son
   fijos, así que el pulgar horizontal sigue visible al maximizar la ventana.
@@ -38,6 +41,15 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
   programa.
 - Reutilización de duraciones ya leídas por huella de contenido, sin volver a
   ejecutar `ffprobe`.
+- **Vista de duplicados** (`Duplicados…`): agrupa los videos con la misma
+  huella de contenido y muestra las copias presentes y no disponibles. No
+  borra ni mueve nada por su cuenta.
+- **Renombrado y organización masiva** con vista previa de los cambios antes
+  de aplicarlos; nunca sobrescribe archivos existentes y revierte los
+  renombrados en disco si falla la base de datos.
+- **Filtros guardados** con nombre: se conservan en la base local junto al
+  tema oscuro, que se recuerda entre sesiones.
+- Versión visible en el título de la ventana y en **Acerca de…**.
 
 ## Requisitos
 
@@ -53,6 +65,8 @@ por ruta o por notas, y asociar notas de texto plano a cada contenido.
 python "video_duration_browser 1.0.py"
 ```
 
+La versión actual es **1.1.0** y se muestra en el título de la ventana.
+
 También se puede ejecutar como módulo desde la carpeta del proyecto:
 
 ```powershell
@@ -64,6 +78,25 @@ Tests (sin dependencias externas):
 ```powershell
 python -m unittest discover -s tests -t .
 ```
+
+Los mismos tests corren en GitHub Actions (`.github/workflows/tests.yml`) en
+varias versiones de Python.
+
+### Ejecutable `.exe`
+
+Para generar un ejecutable que no requiera instalar Python ni FFmpeg:
+
+```powershell
+python -m pip install pyinstaller
+python build_exe.py
+```
+
+El resultado queda en `dist/Nuevo Archivo Total/`. El script detecta
+`ffprobe` en la carpeta del proyecto o en el `PATH` y lo copia junto al
+ejecutable; la app lo busca ahí antes que en el `PATH`. La base
+se crea en esa misma carpeta: si querés conservar tu índice actual, copiá
+`videos_index.db` ahí antes de usar el `.exe`. La licencia MIT está en
+`LICENSE` y el historial de cambios en `CHANGELOG.md`.
 
 Flujo básico (también disponible en **Ayuda / Primer uso…**):
 
@@ -105,6 +138,22 @@ La base se crea junto al lanzador, no dentro de `vdb/`. Si movés el lanzador y
 la carpeta `vdb/` a otra ubicación, se crea una base nueva y vacía en la nueva
 ubicación. Para conservar el índice, mové también `videos_index.db` o usá
 Exportar/Importar notas para trasladar las notas.
+
+## Fechas de creación y modificación
+
+Las columnas **Creado** y **Modificado** muestran las marcas de tiempo del
+sistema de archivos (`st_birthtime` / `st_ctime` en Windows y `st_mtime`), no
+los metadatos incrustados que lee `ffprobe`. Se leen del mismo `stat()` que el
+escaneo ya hace para el tamaño, así que no agregan tiempo de lectura
+apreciable; una pasada separada de 5000 archivos tarda ~0,23 s en un SSD.
+
+- Copiar o descomprimir un video suele asignarle una fecha de creación nueva;
+  moverlo dentro del mismo disco la conserva.
+- En sistemas que no informan la fecha de creación, la columna queda en `—` y
+  se ordena al final.
+- Las filas indexadas antes de esta versión se completan al **Actualizar
+  índice**: la base pasa al esquema v3, que agrega la columna `created` sin
+  borrar notas ni índice.
 
 ## Disponibilidad de los archivos
 
@@ -175,10 +224,20 @@ Nuevo Archivo Total/
     presence.py                   # verificación de disponibilidad
     scan.py                       # escaneo, huellas y duraciones
     fileops.py                    # eliminación de archivos
+    duplicates.py                 # agrupación por huella de contenido
+    filters.py                    # normalización de filtros guardados
+    bulkops.py                    # planeamiento y rollback de cambios masivos
+    theme.py                      # paletas clara/oscura
     ui.py                         # interfaz Tkinter
+  build_exe.py                    # empaquetado con PyInstaller
   tests/                          # tests de la capa de datos y utilidades
+  .github/workflows/tests.yml     # CI de unittest
   README.md                       # este archivo
+  CHANGELOG.md                    # historial de versiones
+  LICENSE                         # licencia MIT
   .gitignore                      # excluye base de datos, respaldos y temporales
 ```
 
-No se incluyen bases de datos, capturas, videos ni binarios de FFmpeg.
+No se incluyen bases de datos, capturas, videos ni binarios de FFmpeg en el
+repositorio; `build_exe.py` los copia al generar el ejecutable si están
+disponibles en la máquina.

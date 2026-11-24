@@ -32,6 +32,11 @@ def fmt_ts(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def fmt_date(ts):
+    """Fecha de archivo; `—` cuando el sistema no informa la creacion."""
+    return "—" if not ts else fmt_ts(ts)
+
+
 def parse_minutes(text):
     text = text.strip().replace(",", ".")
     if not text:

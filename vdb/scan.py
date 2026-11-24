@@ -129,11 +129,24 @@ def under_failed(rel, failed):
     return False
 
 
+def created_time(st):
+    """Fecha de creacion del archivo a partir del mismo `stat` ya leido.
+
+    En Windows `st_birthtime` (o `st_ctime`) es la creacion NTFS. En sistemas
+    que no informan la fecha de nacimiento se devuelve None: `st_ctime` es el
+    cambio de inode, no la creacion.
+    """
+    ts = getattr(st, "st_birthtime", None)
+    if not ts and NT:
+        ts = st.st_ctime
+    return ts or None
+
+
 PROGRESS_SECONDS = 0.3
 
 
 def walk_videos(base, mount, exts, stop, failed, progress=None):
-    """Genera (ruta_relativa, tamano, mtime). Las carpetas ilegibles se anotan en `failed`.
+    """Genera (ruta_relativa, tamano, mtime, created). Las carpetas ilegibles se anotan en `failed`.
 
     `progress`, si se indica, recibe ``(carpetas, archivos, videos, carpeta_actual)``
     como maximo cada PROGRESS_SECONDS y siempre al terminar cada carpeta.
@@ -164,7 +177,7 @@ def walk_videos(base, mount, exts, stop, failed, progress=None):
                                 if rel is None:
                                     continue
                                 videos += 1
-                                yield rel, st.st_size, st.st_mtime
+                                yield rel, st.st_size, st.st_mtime, created_time(st)
                     except OSError:
                         _mark_failed(failed, d, mount)
         except OSError:
@@ -206,8 +219,9 @@ def scan_root(con, job, ffprobe, q, stop, retry_failed, exts, known, info, warni
     def on_walk(dirs, files, videos, current):
         q.put(("walk", base, dirs, files, videos, current))
 
-    for rel, size, mtime in walk_videos(base, mount, exts, stop, failed, on_walk):
-        found[rel] = (size, mtime)
+    for rel, size, mtime, created in walk_videos(base, mount, exts, stop, failed,
+                                                 on_walk):
+        found[rel] = (size, mtime, created)
     if stop.is_set():
         return "cancel"
 
@@ -220,12 +234,13 @@ def scan_root(con, job, ffprobe, q, stop, retry_failed, exts, known, info, warni
     q.put(("stage", 3, base))
     cached = {}
     pfx = ncase(root_rel) + "/" if root_rel else ""
-    for rel, s, m, d, nk in con.execute(
-        "SELECT rel, size, mtime, duration, nkey FROM files WHERE vol = ?", (vol,)
+    for rel, s, m, d, nk, c in con.execute(
+        "SELECT rel, size, mtime, duration, nkey, created FROM files WHERE vol = ?",
+        (vol,),
     ):
         n = ncase(rel)
         if not root_rel or n.startswith(pfx):
-            cached[rel] = (s, m, d, nk)
+            cached[rel] = (s, m, d, nk, c)
 
     q.put(("stage", 4, base))
     # Solo se borran filas de archivos; las notas se conservan siempre.
@@ -248,9 +263,23 @@ def scan_root(con, job, ffprobe, q, stop, retry_failed, exts, known, info, warni
                         [(vol, r) for r in stale])
         con.commit()
 
+    # Las filas que no cambiaron no vuelven a insertarse: completar solo la
+    # fecha de creacion de las que vinieron de un esquema sin esa columna.
+    need_created = [
+        (ct, vol, rel)
+        for rel, (_s, _m, ct) in found.items()
+        if ct is not None and rel in cached and cached[rel][4] is None
+    ]
+    if need_created:
+        con.executemany(
+            "UPDATE files SET created = ? WHERE vol = ? AND rel = ? AND created IS NULL",
+            need_created,
+        )
+        con.commit()
+
     # todo[rel] = (leer_duracion, duracion_previa, clave_previa)
     todo = {}
-    for rel, (s, m) in found.items():
+    for rel, (s, m, _ct) in found.items():
         c = cached.get(rel)
         if c is None:
             todo[rel] = (True, -1.0, None)
@@ -289,12 +318,13 @@ def scan_root(con, job, ffprobe, q, stop, retry_failed, exts, known, info, warni
                         break
                     if definitely_missing(full):
                         continue  # el archivo desaparecio durante el escaneo
-                size, mtime = found[rel]
+                size, mtime, created = found[rel]
                 nkey = fp if fp else f"path:{ident}|{rel}"
                 con.execute(
-                    "INSERT OR REPLACE INTO files (vol, rel, size, mtime, duration, fp, nkey) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (vol, rel, size, mtime, d, fp, nkey),
+                    "INSERT OR REPLACE INTO files "
+                    "(vol, rel, size, mtime, duration, fp, nkey, created) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (vol, rel, size, mtime, d, fp, nkey, created),
                 )
                 old_key = todo[rel][2]
                 if old_key and old_key != nkey:

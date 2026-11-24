@@ -106,7 +106,7 @@ class WalkVideosTest(unittest.TestCase):
 
         failed = set()
         found = {
-            rel for rel, _size, _mtime in scan.walk_videos(
+            rel for rel, _size, _mtime, _created in scan.walk_videos(
                 self.tmp, self.tmp, {".mp4", ".mkv", ".ts"},
                 threading.Event(), failed)
         }
@@ -123,6 +123,7 @@ class WalkVideosTest(unittest.TestCase):
             lambda *args: seen.append(args),
         ))
         self.assertEqual(len(found), 3)
+        self.assertTrue(all(created for _rel, _size, _mtime, created in found))
         self.assertTrue(seen)
         dirs, files, videos, current = seen[-1]
         self.assertGreaterEqual(dirs, 2)
@@ -148,6 +149,15 @@ class HelpersTest(unittest.TestCase):
                 fh.write(b"x")
             self.assertFalse(scan.definitely_missing(path))
         self.assertFalse(scan.root_alive(os.path.join(tmp, "no-existe")))
+
+    def test_created_time_prefiere_birthtime(self):
+        st = SimpleNamespace(st_birthtime=123.0, st_ctime=999.0)
+        self.assertEqual(scan.created_time(st), 123.0)
+
+    def test_created_time_cae_a_ctime_solo_en_windows(self):
+        st = SimpleNamespace(st_ctime=456.0)
+        self.assertEqual(scan.created_time(st), 456.0 if NT else None)
+        self.assertIsNone(scan.created_time(SimpleNamespace(st_ctime=0)))
 
     def test_find_ffprobe_prefiere_la_carpeta_de_la_app(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +187,7 @@ class StageEventsTest(unittest.TestCase):
         con = mock.MagicMock()
         con.execute.return_value.fetchall.return_value = []
         with mock.patch.object(scan, "walk_videos",
-                               return_value=iter([("a.mp4", 10, 0.0)])), \
+                               return_value=iter([("a.mp4", 10, 0.0, 100.0)])), \
                 mock.patch.object(scan, "process_file",
                                   return_value=(60.0, "huella-1", False)), \
                 mock.patch.object(scan, "identify_volume",
@@ -188,6 +198,53 @@ class StageEventsTest(unittest.TestCase):
         self.assertEqual(result, "ok")
         stages = [m[1] for m in q if m[0] == "stage"]
         self.assertEqual(stages, [1, 2, 3, 4, 5, 6, 7])
+
+    def test_scan_guarda_created_y_completa_filas_viejas(self):
+        old_path = database.DB_PATH
+        database.DB_PATH = os.path.join(self.tmp, "videos_index.db")
+        self.addCleanup(setattr, database, "DB_PATH", old_path)
+        con = database.open_db()
+        self.addCleanup(con.close)
+        info = SimpleNamespace(ident="legacy:test", label="Test", mount=self.tmp,
+                               kind="fixed")
+        vid = database.get_or_create_volume(con, info)
+        con.execute(
+            "INSERT INTO files (vol, rel, size, mtime, duration, fp, nkey, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            (vid, "a.mp4", 10, 100.0, 12.5, "fp-a", "key-a"),
+        )
+        con.commit()
+
+        job = database.Job(vid, "legacy:test", self.tmp, "", 1, "Disco (C:)")
+        found = iter([("a.mp4", 10, 100.0, 555.0), ("b.mp4", 10, 100.0, 666.0)])
+        with mock.patch.object(scan, "walk_videos", return_value=found), \
+                mock.patch.object(scan, "process_file",
+                                  return_value=(12.5, "fp-b", False)):
+            result = scan.scan_root(
+                con, job, None, SimpleNamespace(put=lambda *args: None),
+                threading.Event(), False, {".mp4"}, {}, [], [])
+
+        self.assertEqual(result, "ok")
+        dates = dict(con.execute("SELECT rel, created FROM files").fetchall())
+        self.assertEqual(dates["a.mp4"], 555.0)
+        self.assertEqual(dates["b.mp4"], 666.0)
+
+
+class FindProbeTest(unittest.TestCase):
+    def test_find_ffprobe_prefiere_el_binario_junto_a_la_app(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        name = "ffprobe.exe" if NT else "ffprobe"
+        local = os.path.join(tmp.name, name)
+        with open(local, "wb"):
+            pass
+        with mock.patch.object(scan, "APP_DIR", tmp.name), \
+                mock.patch.object(scan.shutil, "which", return_value="del-path"):
+            self.assertEqual(scan.find_ffprobe(), local)
+
+    def test_find_ffprobe_cae_al_path(self):
+        with mock.patch.object(scan.shutil, "which", return_value="del-path"):
+            self.assertEqual(scan.find_ffprobe(), "del-path")
 
 
 if __name__ == "__main__":
